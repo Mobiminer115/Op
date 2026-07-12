@@ -54,6 +54,30 @@ jobs:
             exit 1
           fi
 
+          for source_marker in \
+            '%hook UIScreen' \
+            '%hook UIScreenMode' \
+            '%hook MTKView' \
+            '%hook CAMetalLayer' \
+            'gConfiguredResolutionScale.exchange' \
+            'metalView.drawableSize = targetSize' \
+            'self.scaleSlider.maximumValue = 1.0f'; do
+            if ! grep -Fq "$source_marker" Tweak.xm; then
+              echo "Missing app-resolution implementation marker: $source_marker" >&2
+              exit 1
+            fi
+          done
+
+          if grep -Eq 'CGAffineTransform|setTransform:|\.transform[[:space:]]*=' Tweak.xm; then
+            echo "View transforms are forbidden: resolution scaling must not zoom the app" >&2
+            exit 1
+          fi
+
+          if ! grep -Eq '^GameBoost_FRAMEWORKS.*MetalKit' Makefile; then
+            echo "MetalKit must be linked for MTKView drawable-size synchronization" >&2
+            exit 1
+          fi
+
       - name: Configure build environment
         shell: bash
         run: |
@@ -126,6 +150,11 @@ jobs:
               exit 1
             fi
           done
+
+          if ! otool -L "$dylib_path" | grep -Fq '/System/Library/Frameworks/MetalKit.framework/MetalKit'; then
+            echo "Built dylib is not linked against MetalKit" >&2
+            exit 1
+          fi
 
           output_dir="dist/$BUILD_NAME"
           mkdir -p "$output_dir"
