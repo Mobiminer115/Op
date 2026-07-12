@@ -1,8 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
-#import <objc/runtime.h>
+#import <MetalKit/MTKView.h>
 #import <pthread/qos.h>
+#import <objc/runtime.h>
 
 #include <atomic>
 #include <cmath>
@@ -12,27 +13,50 @@ static NSString * const GBResolutionScaleKey = @"com.gameboost.universal.resolut
 static NSString * const GBSettingsDidChangeNotification = @"com.gameboost.universal.settings-changed";
 
 static std::atomic_bool gPerformanceEnabled(false);
+// gResolutionScale is the scale currently active in the renderer. The menu
+// writes gConfiguredResolutionScale; it becomes active on the next app launch
+// so engines that cache their viewport never see a half-updated frame.
 static std::atomic<double> gResolutionScale(1.0);
+static std::atomic<double> gConfiguredResolutionScale(1.0);
 static id gProcessActivity = nil;
+static UIScreen *gMainScreen = nil;
+static UIScreenMode *gMainScreenMode = nil;
+static CGFloat gOriginalMainScreenScale = 1.0;
+static CGFloat gOriginalMainNativeScale = 1.0;
+static CGRect gOriginalMainNativeBounds = CGRectZero;
+static CGSize gOriginalMainScreenModeSize = CGSizeZero;
 
-static const void *GBBaseDrawableSizeKey = &GBBaseDrawableSizeKey;
-static const void *GBLastDrawableSizeKey = &GBLastDrawableSizeKey;
+static const void *GBMetalKitManagedLayerKey = &GBMetalKitManagedLayerKey;
+static const void *GBOverlayWindowKey = &GBOverlayWindowKey;
 
 static double GBClampScale(double scale) {
     if (!std::isfinite(scale)) {
         return 1.0;
     }
-    return fmin(1.5, fmax(0.5, scale));
+    // This control is a performance/downscale control. Values above 1.0 are
+    // deliberately rejected so it cannot turn into display zoom or expensive
+    // supersampling.
+    return fmin(1.0, fmax(0.5, scale));
 }
 
-static BOOL GBSizesNearlyEqual(CGSize lhs, CGSize rhs) {
-    return fabs(lhs.width - rhs.width) < 0.5 && fabs(lhs.height - rhs.height) < 0.5;
+static BOOL GBIsUsableSize(CGSize size) {
+    return size.width > 0.0 && size.height > 0.0 &&
+           std::isfinite(size.width) && std::isfinite(size.height);
 }
 
-static CGSize GBScaledDrawableSize(CGSize baseSize) {
-    const double scale = gResolutionScale.load(std::memory_order_relaxed);
-    return CGSizeMake(MAX(1.0, round(baseSize.width * scale)),
-                      MAX(1.0, round(baseSize.height * scale)));
+static CGFloat GBCurrentScreenScale(void) {
+    return MAX(0.5, gOriginalMainScreenScale *
+        (CGFloat)gResolutionScale.load(std::memory_order_relaxed));
+}
+
+static CGSize GBPixelSizeForBounds(CGSize boundsSize) {
+    if (!GBIsUsableSize(boundsSize)) {
+        return CGSizeZero;
+    }
+
+    const CGFloat screenScale = GBCurrentScreenScale();
+    return CGSizeMake(MAX(1.0, round(boundsSize.width * screenScale)),
+                      MAX(1.0, round(boundsSize.height * screenScale)));
 }
 
 static BOOL GBShouldLoadInCurrentProcess(void) {
@@ -124,21 +148,6 @@ static void GBApplyQoSToCurrentRenderThread(void) {
     }
 }
 
-static void GBRefreshMetalLayersInLayer(CALayer *layer) {
-    if ([layer isKindOfClass:CAMetalLayer.class]) {
-        CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
-        NSValue *baseValue = objc_getAssociatedObject(metalLayer, GBBaseDrawableSizeKey);
-        if (baseValue != nil) {
-            metalLayer.drawableSize = baseValue.CGSizeValue;
-        }
-    }
-
-    NSArray<CALayer *> *sublayers = layer.sublayers.copy;
-    for (CALayer *sublayer in sublayers) {
-        GBRefreshMetalLayersInLayer(sublayer);
-    }
-}
-
 static NSArray<UIWindow *> *GBApplicationWindows(void) {
     if (@available(iOS 13.0, *)) {
         NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
@@ -158,22 +167,80 @@ static NSArray<UIWindow *> *GBApplicationWindows(void) {
     return legacyWindows ?: @[];
 }
 
-static void GBRefreshMetalLayers(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        for (UIWindow *window in GBApplicationWindows()) {
-            GBRefreshMetalLayersInLayer(window.layer);
+static void GBApplyResolutionToViewTree(UIView *view, CGFloat screenScale) {
+    view.contentScaleFactor = screenScale;
+
+    if ([view isKindOfClass:MTKView.class]) {
+        MTKView *metalView = (MTKView *)view;
+        CAMetalLayer *metalLayer = (CAMetalLayer *)metalView.layer;
+        objc_setAssociatedObject(metalLayer,
+                                 GBMetalKitManagedLayerKey,
+                                 @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        CGSize targetSize = GBPixelSizeForBounds(metalView.bounds.size);
+        if (GBIsUsableSize(targetSize)) {
+            // Going through MTKView is important: its delegate receives the new
+            // drawable size and can rebuild projection/viewport state. Changing
+            // only the underlying CAMetalLayer is what caused the zoom/crop bug.
+            metalView.drawableSize = targetSize;
         }
-    });
+    }
+
+    for (UIView *subview in view.subviews.copy) {
+        GBApplyResolutionToViewTree(subview, screenScale);
+    }
+}
+
+static void GBApplyResolutionToLayerTree(CALayer *layer, CGFloat screenScale) {
+    layer.contentsScale = screenScale;
+
+    if ([layer isKindOfClass:CAMetalLayer.class] &&
+        ![objc_getAssociatedObject(layer, GBMetalKitManagedLayerKey) boolValue]) {
+        CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
+        CGSize targetSize = GBPixelSizeForBounds(metalLayer.bounds.size);
+        if (GBIsUsableSize(targetSize)) {
+            metalLayer.drawableSize = targetSize;
+        }
+    }
+
+    for (CALayer *sublayer in layer.sublayers.copy) {
+        GBApplyResolutionToLayerTree(sublayer, screenScale);
+    }
+}
+
+static void GBRefreshApplicationResolution(void) {
+    dispatch_block_t refresh = ^{
+        const CGFloat screenScale = GBCurrentScreenScale();
+        for (UIWindow *window in GBApplicationWindows()) {
+            if ([objc_getAssociatedObject(window, GBOverlayWindowKey) boolValue]) {
+                continue;
+            }
+            GBApplyResolutionToViewTree(window, screenScale);
+            GBApplyResolutionToLayerTree(window.layer, screenScale);
+        }
+    };
+
+    if (NSThread.isMainThread) {
+        refresh();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), refresh);
+    }
 }
 
 static void GBSetResolutionScale(double scale, BOOL persist) {
     scale = GBClampScale(scale);
-    gResolutionScale.store(scale, std::memory_order_relaxed);
+    const double oldScale =
+        gConfiguredResolutionScale.exchange(scale, std::memory_order_relaxed);
+
+    if (fabs(oldScale - scale) < 0.001) {
+        return;
+    }
 
     if (persist) {
         [NSUserDefaults.standardUserDefaults setDouble:scale forKey:GBResolutionScaleKey];
+        [NSUserDefaults.standardUserDefaults synchronize];
     }
-    GBRefreshMetalLayers();
     GBPostSettingsChanged();
 }
 
@@ -202,6 +269,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 @property(nonatomic, strong) UISwitch *performanceSwitch;
 @property(nonatomic, strong) UISlider *scaleSlider;
 @property(nonatomic, strong) UILabel *scaleValueLabel;
+@property(nonatomic, strong) UILabel *scaleHintLabel;
 @property(nonatomic, assign) BOOL hasInitialButtonPosition;
 @end
 
@@ -269,7 +337,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     [self.panel addSubview:performanceHint];
 
     UILabel *scaleLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 108.0, 180.0, 25.0)];
-    scaleLabel.text = @"Metal render scale";
+    scaleLabel.text = @"Độ phân giải app";
     scaleLabel.textColor = UIColor.whiteColor;
     scaleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
     [self.panel addSubview:scaleLabel];
@@ -282,17 +350,16 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
     self.scaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(18.0, 137.0, 264.0, 30.0)];
     self.scaleSlider.minimumValue = 0.5f;
-    self.scaleSlider.maximumValue = 1.5f;
+    self.scaleSlider.maximumValue = 1.0f;
     self.scaleSlider.minimumTrackTintColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.0 alpha:1.0];
     [self.scaleSlider addTarget:self action:@selector(scaleSliderChanged:)
                forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.scaleSlider];
 
-    UILabel *scaleHint = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 169.0, 264.0, 18.0)];
-    scaleHint.text = @"50% nhẹ hơn  •  100% gốc  •  150% nét hơn";
-    scaleHint.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
-    scaleHint.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
-    [self.panel addSubview:scaleHint];
+    self.scaleHintLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 169.0, 264.0, 18.0)];
+    self.scaleHintLabel.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
+    self.scaleHintLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
+    [self.panel addSubview:self.scaleHintLabel];
 
     UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
     resetButton.frame = CGRectMake(18.0, 198.0, 264.0, 32.0);
@@ -327,9 +394,22 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
 - (void)settingsDidChange {
     self.performanceSwitch.on = gPerformanceEnabled.load(std::memory_order_relaxed);
-    const double scale = gResolutionScale.load(std::memory_order_relaxed);
-    self.scaleSlider.value = (float)scale;
-    self.scaleValueLabel.text = [NSString stringWithFormat:@"%.0f%%", scale * 100.0];
+    const double activeScale = gResolutionScale.load(std::memory_order_relaxed);
+    const double configuredScale =
+        gConfiguredResolutionScale.load(std::memory_order_relaxed);
+    const BOOL needsRelaunch = fabs(activeScale - configuredScale) >= 0.001;
+
+    self.scaleSlider.value = (float)configuredScale;
+    if (needsRelaunch) {
+        self.scaleValueLabel.text =
+            [NSString stringWithFormat:@"%.0f%%↻", configuredScale * 100.0];
+    } else {
+        self.scaleValueLabel.text =
+            [NSString stringWithFormat:@"%.0f%%", configuredScale * 100.0];
+    }
+    self.scaleHintLabel.text = needsRelaunch
+        ? @"Đã lưu • đóng/mở lại app để áp dụng an toàn"
+        : @"Giảm pixel thật • giữ nguyên khung hình, không zoom";
 }
 
 - (void)togglePanel {
@@ -447,42 +527,115 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     self.overlayWindow.backgroundColor = UIColor.clearColor;
     // Keep the tweak above the game but below system alert windows.
     self.overlayWindow.windowLevel = UIWindowLevelAlert - 1.0;
+    objc_setAssociatedObject(self.overlayWindow,
+                             GBOverlayWindowKey,
+                             @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     self.overlayWindow.rootViewController = [OAGameBoostOverlayViewController new];
     self.overlayWindow.hidden = NO;
+
+    // The control panel stays at the device's native backing scale. It is not
+    // part of the app/game framebuffer being downscaled.
+    GBApplyResolutionToViewTree(self.overlayWindow, gOriginalMainScreenScale);
+    GBApplyResolutionToLayerTree(self.overlayWindow.layer, gOriginalMainScreenScale);
 }
 
 @end
 
 
-%hook CAMetalLayer
+%hook UIScreen
+
+- (CGFloat)scale {
+    CGFloat originalScale = gOriginalMainScreenScale;
+    if (self != gMainScreen) {
+        originalScale = %orig;
+    }
+    return MAX(0.5, originalScale *
+        (CGFloat)gResolutionScale.load(std::memory_order_relaxed));
+}
+
+- (CGFloat)nativeScale {
+    CGFloat originalScale = gOriginalMainNativeScale;
+    if (self != gMainScreen) {
+        originalScale = %orig;
+    }
+    return MAX(0.5, originalScale *
+        (CGFloat)gResolutionScale.load(std::memory_order_relaxed));
+}
+
+- (CGRect)nativeBounds {
+    CGRect bounds = gOriginalMainNativeBounds;
+    if (self != gMainScreen) {
+        bounds = %orig;
+    }
+    const CGFloat factor =
+        (CGFloat)gResolutionScale.load(std::memory_order_relaxed);
+    bounds.size.width = MAX(1.0, round(bounds.size.width * factor));
+    bounds.size.height = MAX(1.0, round(bounds.size.height * factor));
+    return bounds;
+}
+
+%end
+
+
+%hook UIScreenMode
+
+- (CGSize)size {
+    CGSize size = gOriginalMainScreenModeSize;
+    if (self != gMainScreenMode) {
+        size = %orig;
+    }
+    const CGFloat factor =
+        (CGFloat)gResolutionScale.load(std::memory_order_relaxed);
+    size.width = MAX(1.0, round(size.width * factor));
+    size.height = MAX(1.0, round(size.height * factor));
+    return size;
+}
+
+%end
+
+
+%hook MTKView
 
 - (void)setDrawableSize:(CGSize)drawableSize {
-    if (drawableSize.width <= 0.0 || drawableSize.height <= 0.0 ||
-        !std::isfinite(drawableSize.width) || !std::isfinite(drawableSize.height)) {
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    objc_setAssociatedObject(metalLayer,
+                             GBMetalKitManagedLayerKey,
+                             @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if (!GBIsUsableSize(drawableSize)) {
         %orig(drawableSize);
         return;
     }
 
-    NSValue *baseValue = objc_getAssociatedObject(self, GBBaseDrawableSizeKey);
-    NSValue *lastValue = objc_getAssociatedObject(self, GBLastDrawableSizeKey);
-    CGSize baseSize = drawableSize;
-
-    if (baseValue != nil && lastValue != nil &&
-        GBSizesNearlyEqual(drawableSize, lastValue.CGSizeValue)) {
-        baseSize = baseValue.CGSizeValue;
-    } else {
-        objc_setAssociatedObject(self,
-                                 GBBaseDrawableSizeKey,
-                                 [NSValue valueWithCGSize:drawableSize],
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (gResolutionScale.load(std::memory_order_relaxed) >= 0.999) {
+        %orig(drawableSize);
+        return;
     }
 
-    CGSize adjustedSize = GBScaledDrawableSize(baseSize);
-    objc_setAssociatedObject(self,
-                             GBLastDrawableSizeKey,
-                             [NSValue valueWithCGSize:adjustedSize],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    %orig(adjustedSize);
+    CGSize targetSize = GBPixelSizeForBounds(self.bounds.size);
+    %orig(GBIsUsableSize(targetSize) ? targetSize : drawableSize);
+}
+
+%end
+
+
+%hook CAMetalLayer
+
+- (void)setDrawableSize:(CGSize)drawableSize {
+    if (!GBIsUsableSize(drawableSize)) {
+        %orig(drawableSize);
+        return;
+    }
+
+    if (gResolutionScale.load(std::memory_order_relaxed) >= 0.999) {
+        %orig(drawableSize);
+        return;
+    }
+
+    CGSize targetSize = GBPixelSizeForBounds(self.bounds.size);
+    %orig(GBIsUsableSize(targetSize) ? targetSize : drawableSize);
 }
 
 - (id)nextDrawable {
@@ -500,12 +653,22 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         }
 
         NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        gMainScreen = UIScreen.mainScreen;
+        gMainScreenMode = gMainScreen.currentMode;
+        gOriginalMainScreenScale = MAX(1.0, gMainScreen.scale);
+        gOriginalMainNativeScale = MAX(1.0, gMainScreen.nativeScale);
+        gOriginalMainNativeBounds = gMainScreen.nativeBounds;
+        gOriginalMainScreenModeSize = gMainScreenMode != nil
+            ? gMainScreenMode.size
+            : gOriginalMainNativeBounds.size;
         double savedScale = [defaults objectForKey:GBResolutionScaleKey] == nil
             ? 1.0
             : [defaults doubleForKey:GBResolutionScaleKey];
         BOOL savedPerformance = [defaults boolForKey:GBPerformanceKey];
 
-        gResolutionScale.store(GBClampScale(savedScale), std::memory_order_relaxed);
+        const double initialScale = GBClampScale(savedScale);
+        gResolutionScale.store(initialScale, std::memory_order_relaxed);
+        gConfiguredResolutionScale.store(initialScale, std::memory_order_relaxed);
         gPerformanceEnabled.store(savedPerformance && GBThermalStateAllowsBoost(),
                                   std::memory_order_relaxed);
 
@@ -516,6 +679,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
                                                          queue:NSOperationQueue.mainQueue
                                                     usingBlock:^(__unused NSNotification *notification) {
             [[OAGameBoostOverlayManager sharedManager] installIfPossible];
+            GBRefreshApplicationResolution();
         }];
 
         [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification
@@ -531,6 +695,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         dispatch_async(dispatch_get_main_queue(), ^{
             GBUpdateProcessActivity(gPerformanceEnabled.load(std::memory_order_relaxed));
             [[OAGameBoostOverlayManager sharedManager] installIfPossible];
+            GBRefreshApplicationResolution();
         });
     }
 }
