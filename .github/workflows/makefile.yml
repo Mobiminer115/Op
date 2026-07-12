@@ -1,0 +1,152 @@
+name: Build GameBoost Universal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rootful-ios12-13-arm64
+            package_scheme: rootful
+            minimum_ios: "12.0"
+            architectures: arm64
+            required_architectures: arm64
+          - name: rootful-ios14-18
+            package_scheme: rootful
+            minimum_ios: "14.0"
+            architectures: arm64 arm64e
+            required_architectures: arm64 arm64e
+          - name: rootless-ios15-18
+            package_scheme: rootless
+            minimum_ios: "15.0"
+            architectures: arm64 arm64e
+            required_architectures: arm64 arm64e
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for required_file in Makefile control Tweak.xm GameBoost.plist; do
+            if [[ ! -f "$required_file" ]]; then
+              echo "Missing required file: $required_file" >&2
+              exit 1
+            fi
+          done
+
+          plutil -lint GameBoost.plist
+          filter_bundle="$(/usr/libexec/PlistBuddy -c 'Print :Filter:Bundles:0' GameBoost.plist)"
+          if [[ "$filter_bundle" != "com.apple.UIKit" ]]; then
+            echo "GameBoost.plist must target com.apple.UIKit, got: $filter_bundle" >&2
+            exit 1
+          fi
+
+      - name: Configure build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_path="/Applications/Xcode_16.4.app/Contents/Developer"
+          if [[ ! -d "$xcode_path" ]]; then
+            echo "Required Xcode 16.4 is unavailable at: $xcode_path" >&2
+            exit 1
+          fi
+
+          printf 'THEOS=%s\n' "$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          printf 'DEVELOPER_DIR=%s\n' "$xcode_path" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$xcode_path"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ldid xz
+          git clone --recursive --depth=1 --shallow-submodules \
+            https://github.com/theos/theos.git "$THEOS"
+
+      - name: Build and verify package
+        shell: bash
+        env:
+          BUILD_NAME: ${{ matrix.name }}
+          PACKAGE_SCHEME: ${{ matrix.package_scheme }}
+          MINIMUM_IOS: ${{ matrix.minimum_ios }}
+          ARCHS_TO_BUILD: ${{ matrix.architectures }}
+          REQUIRED_ARCHS: ${{ matrix.required_architectures }}
+        run: |
+          set -euo pipefail
+
+          make clean
+          if [[ "$PACKAGE_SCHEME" == "rootless" ]]; then
+            make package FINALPACKAGE=1 \
+              THEOS_PACKAGE_SCHEME=rootless \
+              ARCHS="$ARCHS_TO_BUILD" \
+              TARGET="iphone:clang:latest:$MINIMUM_IOS"
+          else
+            make package FINALPACKAGE=1 \
+              ARCHS="$ARCHS_TO_BUILD" \
+              TARGET="iphone:clang:latest:$MINIMUM_IOS"
+          fi
+
+          package_path="$(find packages -type f -name '*.deb' -print | sed -n '1p')"
+          dylib_path="$(find .theos/_ -type f -name GameBoost.dylib -print | sed -n '1p')"
+          plist_path="$(find .theos/_ -type f -name GameBoost.plist -print | sed -n '1p')"
+
+          for output_path in "$package_path" "$dylib_path" "$plist_path"; do
+            if [[ -z "$output_path" || ! -s "$output_path" ]]; then
+              echo "Expected build output is missing" >&2
+              exit 1
+            fi
+          done
+
+          plutil -lint "$plist_path"
+          staged_filter="$(/usr/libexec/PlistBuddy -c 'Print :Filter:Bundles:0' "$plist_path")"
+          if [[ "$staged_filter" != "com.apple.UIKit" ]]; then
+            echo "Staged filter is incorrect: $staged_filter" >&2
+            exit 1
+          fi
+
+          archs="$(lipo -archs "$dylib_path")"
+          for required_arch in $REQUIRED_ARCHS; do
+            if ! grep -qw "$required_arch" <<<"$archs"; then
+              echo "Missing architecture $required_arch; binary has: $archs" >&2
+              exit 1
+            fi
+          done
+
+          output_dir="dist/$BUILD_NAME"
+          mkdir -p "$output_dir"
+          cp "$package_path" "$output_dir/"
+          cp "$dylib_path" "$output_dir/GameBoost.dylib"
+          cp "$plist_path" "$output_dir/GameBoost.plist"
+
+          otool -l "$dylib_path" > "$output_dir/load-commands.txt"
+
+          {
+            printf 'Build: %s\n' "$BUILD_NAME"
+            printf 'Package scheme: %s\n' "$PACKAGE_SCHEME"
+            printf 'Minimum iOS: %s\n' "$MINIMUM_IOS"
+            printf 'Architectures: %s\n' "$archs"
+            printf 'Substrate filter: %s\n' "$staged_filter"
+          } | tee "$output_dir/build-info.txt"
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gameboost-${{ matrix.name }}
+          path: dist/${{ matrix.name }}/
+          if-no-files-found: error
+          retention-days: 30
