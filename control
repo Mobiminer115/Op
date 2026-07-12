@@ -1,0 +1,9 @@
+Package: com.gameboost.universal
+Name: GameBoost Universal
+Version: 1.1.0
+Architecture: iphoneos-arm
+Description: Universal UIKit overlay with safe render-thread QoS and Metal render-scale control.
+Maintainer: GameBoost
+Author: GameBoost
+Section: Tweaks
+Depends: mobilesubstrate
