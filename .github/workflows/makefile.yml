@@ -55,12 +55,19 @@ jobs:
           fi
 
           for source_marker in \
+            '%hook UIApplication' \
             '%hook UIScreen' \
             '%hook UIScreenMode' \
             '%hook MTKView' \
             '%hook CAMetalLayer' \
+            'GBLandscapeLockKey' \
+            'supportedInterfaceOrientationsForWindow' \
+            'requestGeometryUpdateWithPreferences' \
+            'GBPreferredLandscapeOrientation' \
+            'self.landscapeSwitch' \
             'gConfiguredResolutionScale.exchange' \
             'metalView.drawableSize = targetSize' \
+            'self.scaleSlider.minimumValue = 0.1f' \
             'self.scaleSlider.maximumValue = 1.0f'; do
             if ! grep -Fq "$source_marker" Tweak.xm; then
               echo "Missing app-resolution implementation marker: $source_marker" >&2
