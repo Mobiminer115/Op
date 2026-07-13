@@ -10,9 +10,11 @@
 
 static NSString * const GBPerformanceKey = @"com.gameboost.universal.performance-enabled";
 static NSString * const GBResolutionScaleKey = @"com.gameboost.universal.resolution-scale";
+static NSString * const GBLandscapeLockKey = @"com.gameboost.universal.landscape-lock-enabled";
 static NSString * const GBSettingsDidChangeNotification = @"com.gameboost.universal.settings-changed";
 
 static std::atomic_bool gPerformanceEnabled(false);
+static std::atomic_bool gLandscapeLockEnabled(false);
 // gResolutionScale is the scale currently active in the renderer. The menu
 // writes gConfiguredResolutionScale; it becomes active on the next app launch
 // so engines that cache their viewport never see a half-updated frame.
@@ -28,6 +30,9 @@ static CGSize gOriginalMainScreenModeSize = CGSizeZero;
 
 static const void *GBMetalKitManagedLayerKey = &GBMetalKitManagedLayerKey;
 static const void *GBOverlayWindowKey = &GBOverlayWindowKey;
+static const void *GBOrientationMaskOverrideKey = &GBOrientationMaskOverrideKey;
+static const void *GBAutorotateOverrideKey = &GBAutorotateOverrideKey;
+static const void *GBPreferredOrientationOverrideKey = &GBPreferredOrientationOverrideKey;
 
 static double GBClampScale(double scale) {
     if (!std::isfinite(scale)) {
@@ -36,7 +41,7 @@ static double GBClampScale(double scale) {
     // This control is a performance/downscale control. Values above 1.0 are
     // deliberately rejected so it cannot turn into display zoom or expensive
     // supersampling.
-    return fmin(1.0, fmax(0.5, scale));
+    return fmin(1.0, fmax(0.1, scale));
 }
 
 static BOOL GBIsUsableSize(CGSize size) {
@@ -45,7 +50,7 @@ static BOOL GBIsUsableSize(CGSize size) {
 }
 
 static CGFloat GBCurrentScreenScale(void) {
-    return MAX(0.5, gOriginalMainScreenScale *
+    return MAX(0.1, gOriginalMainScreenScale *
         (CGFloat)gResolutionScale.load(std::memory_order_relaxed));
 }
 
@@ -167,6 +172,286 @@ static NSArray<UIWindow *> *GBApplicationWindows(void) {
     return legacyWindows ?: @[];
 }
 
+static BOOL GBIsOverlayWindow(UIWindow *window) {
+    return [objc_getAssociatedObject(window, GBOverlayWindowKey) boolValue];
+}
+
+static UIInterfaceOrientationMask GBDeclaredOrientationMask(void) {
+    static UIInterfaceOrientationMask mask;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSBundle *bundle = NSBundle.mainBundle;
+        BOOL isPad = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad;
+        NSString *deviceKey = isPad
+            ? @"UISupportedInterfaceOrientations~ipad"
+            : @"UISupportedInterfaceOrientations~iphone";
+        NSArray<NSString *> *names = [bundle objectForInfoDictionaryKey:deviceKey];
+        if (![names isKindOfClass:NSArray.class] || names.count == 0) {
+            names = [bundle objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations"];
+        }
+
+        for (NSString *name in names) {
+            if ([name isEqualToString:@"UIInterfaceOrientationPortrait"]) {
+                mask |= UIInterfaceOrientationMaskPortrait;
+            } else if ([name isEqualToString:@"UIInterfaceOrientationPortraitUpsideDown"]) {
+                mask |= UIInterfaceOrientationMaskPortraitUpsideDown;
+            } else if ([name isEqualToString:@"UIInterfaceOrientationLandscapeLeft"]) {
+                mask |= UIInterfaceOrientationMaskLandscapeLeft;
+            } else if ([name isEqualToString:@"UIInterfaceOrientationLandscapeRight"]) {
+                mask |= UIInterfaceOrientationMaskLandscapeRight;
+            }
+        }
+
+        if (mask == 0) {
+            mask = isPad ? UIInterfaceOrientationMaskAll
+                         : UIInterfaceOrientationMaskPortrait;
+        }
+    });
+    return mask;
+}
+
+static UIWindow *GBHostApplicationWindow(void) {
+    UIWindow *fallback = nil;
+    for (UIWindow *window in GBApplicationWindows()) {
+        if (GBIsOverlayWindow(window) || window.hidden || window.alpha <= 0.01 ||
+            window.rootViewController == nil) {
+            continue;
+        }
+        if (window.isKeyWindow) {
+            return window;
+        }
+        if (fallback == nil || window.windowLevel < fallback.windowLevel) {
+            fallback = window;
+        }
+    }
+    return fallback;
+}
+
+static UIViewController *GBTopViewController(UIViewController *controller) {
+    while (controller != nil) {
+        UIViewController *next = nil;
+        if (controller.presentedViewController != nil &&
+            !controller.presentedViewController.isBeingDismissed) {
+            next = controller.presentedViewController;
+        } else if ([controller isKindOfClass:UINavigationController.class]) {
+            next = ((UINavigationController *)controller).visibleViewController;
+        } else if ([controller isKindOfClass:UITabBarController.class]) {
+            next = ((UITabBarController *)controller).selectedViewController;
+        } else if ([controller isKindOfClass:UISplitViewController.class]) {
+            next = ((UISplitViewController *)controller).viewControllers.lastObject;
+        }
+
+        if (next == nil || next == controller) {
+            break;
+        }
+        controller = next;
+    }
+    return controller;
+}
+
+static UIInterfaceOrientationMask GBHostOrientationMask(void) {
+    UIWindow *hostWindow = GBHostApplicationWindow();
+    UIViewController *controller =
+        GBTopViewController(hostWindow.rootViewController);
+    UIInterfaceOrientationMask mask = controller != nil
+        ? controller.supportedInterfaceOrientations
+        : 0;
+    return mask != 0 ? mask : GBDeclaredOrientationMask();
+}
+
+static BOOL GBAppIsLandscapeOnly(void) {
+    const UIInterfaceOrientationMask mask = GBDeclaredOrientationMask();
+    const BOOL supportsLandscape = (mask & UIInterfaceOrientationMaskLandscape) != 0;
+    const UIInterfaceOrientationMask portraitMask =
+        UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown;
+    return supportsLandscape && (mask & portraitMask) == 0;
+}
+
+static BOOL GBShouldKeepLandscape(void) {
+    return gLandscapeLockEnabled.load(std::memory_order_relaxed) ||
+           GBAppIsLandscapeOnly();
+}
+
+static UIInterfaceOrientationMask GBLandscapeMask(void) {
+    UIInterfaceOrientationMask landscapeMask =
+        GBHostOrientationMask() & UIInterfaceOrientationMaskLandscape;
+    return landscapeMask != 0 ? landscapeMask : UIInterfaceOrientationMaskLandscape;
+}
+
+static BOOL GBMaskContainsOrientation(UIInterfaceOrientationMask mask,
+                                      UIInterfaceOrientation orientation) {
+    return orientation != UIInterfaceOrientationUnknown &&
+           (mask & (1UL << orientation)) != 0;
+}
+
+static UIInterfaceOrientation GBPreferredLandscapeOrientation(void) {
+    const UIInterfaceOrientationMask mask = GBLandscapeMask();
+    UIWindow *hostWindow = GBHostApplicationWindow();
+    UIInterfaceOrientation current = UIInterfaceOrientationUnknown;
+    if (@available(iOS 13.0, *)) {
+        current = hostWindow.windowScene.interfaceOrientation;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        current = UIApplication.sharedApplication.statusBarOrientation;
+#pragma clang diagnostic pop
+    }
+    if (UIInterfaceOrientationIsLandscape(current) &&
+        GBMaskContainsOrientation(mask, current)) {
+        return current;
+    }
+
+    UIDeviceOrientation deviceOrientation = UIDevice.currentDevice.orientation;
+    UIInterfaceOrientation candidate = UIInterfaceOrientationUnknown;
+    if (deviceOrientation == UIDeviceOrientationLandscapeLeft) {
+        candidate = UIInterfaceOrientationLandscapeRight;
+    } else if (deviceOrientation == UIDeviceOrientationLandscapeRight) {
+        candidate = UIInterfaceOrientationLandscapeLeft;
+    }
+    if (GBMaskContainsOrientation(mask, candidate)) {
+        return candidate;
+    }
+    if ((mask & UIInterfaceOrientationMaskLandscapeRight) != 0) {
+        return UIInterfaceOrientationLandscapeRight;
+    }
+    return UIInterfaceOrientationLandscapeLeft;
+}
+
+static void GBInstallControllerOrientationOverrides(UIViewController *controller) {
+    if (controller == nil ||
+        [controller isKindOfClass:NSClassFromString(@"OAGameBoostOverlayViewController")]) {
+        return;
+    }
+
+    Class controllerClass = object_getClass(controller);
+
+    if (![objc_getAssociatedObject(controllerClass, GBOrientationMaskOverrideKey) boolValue]) {
+        SEL selector = @selector(supportedInterfaceOrientations);
+        Method method = class_getInstanceMethod(controllerClass, selector);
+        IMP original = class_getMethodImplementation(controllerClass, selector);
+        const char *types = method_getTypeEncoding(method);
+        IMP replacement = imp_implementationWithBlock(^UIInterfaceOrientationMask(id object) {
+            using OriginalFunction = UIInterfaceOrientationMask (*)(id, SEL);
+            UIInterfaceOrientationMask originalMask =
+                ((OriginalFunction)original)(object, selector);
+            if (GBShouldKeepLandscape()) {
+                UIInterfaceOrientationMask landscapeMask =
+                    originalMask & UIInterfaceOrientationMaskLandscape;
+                return landscapeMask != 0
+                    ? landscapeMask
+                    : UIInterfaceOrientationMaskLandscape;
+            }
+            return originalMask;
+        });
+        class_replaceMethod(controllerClass, selector, replacement, types);
+        objc_setAssociatedObject(controllerClass,
+                                 GBOrientationMaskOverrideKey,
+                                 @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    if (![objc_getAssociatedObject(controllerClass, GBAutorotateOverrideKey) boolValue]) {
+        SEL selector = @selector(shouldAutorotate);
+        Method method = class_getInstanceMethod(controllerClass, selector);
+        IMP original = class_getMethodImplementation(controllerClass, selector);
+        const char *types = method_getTypeEncoding(method);
+        IMP replacement = imp_implementationWithBlock(^BOOL(id object) {
+            if (GBShouldKeepLandscape()) {
+                return YES;
+            }
+            using OriginalFunction = BOOL (*)(id, SEL);
+            return ((OriginalFunction)original)(object, selector);
+        });
+        class_replaceMethod(controllerClass, selector, replacement, types);
+        objc_setAssociatedObject(controllerClass,
+                                 GBAutorotateOverrideKey,
+                                 @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    if (![objc_getAssociatedObject(controllerClass, GBPreferredOrientationOverrideKey) boolValue]) {
+        SEL selector = @selector(preferredInterfaceOrientationForPresentation);
+        Method method = class_getInstanceMethod(controllerClass, selector);
+        IMP original = class_getMethodImplementation(controllerClass, selector);
+        const char *types = method_getTypeEncoding(method);
+        IMP replacement = imp_implementationWithBlock(^UIInterfaceOrientation(id object) {
+            if (GBShouldKeepLandscape()) {
+                return GBPreferredLandscapeOrientation();
+            }
+            using OriginalFunction = UIInterfaceOrientation (*)(id, SEL);
+            return ((OriginalFunction)original)(object, selector);
+        });
+        class_replaceMethod(controllerClass, selector, replacement, types);
+        objc_setAssociatedObject(controllerClass,
+                                 GBPreferredOrientationOverrideKey,
+                                 @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void GBRequestOrientationUpdate(void) {
+    dispatch_block_t update = ^{
+        UIWindow *hostWindow = GBHostApplicationWindow();
+        UIViewController *controller =
+            GBTopViewController(hostWindow.rootViewController);
+        GBInstallControllerOrientationOverrides(hostWindow.rootViewController);
+        GBInstallControllerOrientationOverrides(controller);
+        const BOOL keepLandscape = GBShouldKeepLandscape();
+        const UIInterfaceOrientationMask requestedMask = keepLandscape
+            ? GBLandscapeMask()
+            : GBHostOrientationMask();
+
+        if (@available(iOS 16.0, *)) {
+            [hostWindow.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+            [controller setNeedsUpdateOfSupportedInterfaceOrientations];
+            UIWindowScene *windowScene = hostWindow.windowScene;
+            if (windowScene != nil && requestedMask != 0) {
+                UIWindowSceneGeometryPreferencesIOS *preferences =
+                    [[UIWindowSceneGeometryPreferencesIOS alloc]
+                        initWithInterfaceOrientations:requestedMask];
+                [windowScene requestGeometryUpdateWithPreferences:preferences
+                                                      errorHandler:^(__unused NSError *error) {
+                }];
+            }
+        } else {
+            if (keepLandscape) {
+                @try {
+                    [UIDevice.currentDevice
+                        setValue:@(GBPreferredLandscapeOrientation())
+                          forKey:@"orientation"];
+                } @catch (__unused NSException *exception) {
+                }
+            }
+            [UIViewController attemptRotationToDeviceOrientation];
+        }
+    };
+
+    if (NSThread.isMainThread) {
+        update();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), update);
+    }
+}
+
+static void GBSetLandscapeLockEnabled(BOOL enabled, BOOL persist) {
+    const BOOL oldValue =
+        gLandscapeLockEnabled.exchange(enabled, std::memory_order_relaxed);
+    if (persist) {
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:GBLandscapeLockKey];
+        [NSUserDefaults.standardUserDefaults synchronize];
+    }
+    if (oldValue == enabled && !GBAppIsLandscapeOnly()) {
+        return;
+    }
+
+    GBPostSettingsChanged();
+    GBRequestOrientationUpdate();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        GBRequestOrientationUpdate();
+    });
+}
+
 static void GBApplyResolutionToViewTree(UIView *view, CGFloat screenScale) {
     view.contentScaleFactor = screenScale;
 
@@ -267,6 +552,8 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 @property(nonatomic, strong) UIButton *menuButton;
 @property(nonatomic, strong) UIView *panel;
 @property(nonatomic, strong) UISwitch *performanceSwitch;
+@property(nonatomic, strong) UISwitch *landscapeSwitch;
+@property(nonatomic, strong) UILabel *landscapeHintLabel;
 @property(nonatomic, strong) UISlider *scaleSlider;
 @property(nonatomic, strong) UILabel *scaleValueLabel;
 @property(nonatomic, strong) UILabel *scaleHintLabel;
@@ -294,7 +581,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
                                                                                  action:@selector(dragMenuButton:)]];
     [self.view addSubview:self.menuButton];
 
-    self.panel = [[UIView alloc] initWithFrame:CGRectMake(78.0, 96.0, 300.0, 242.0)];
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake(78.0, 96.0, 300.0, 294.0)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0.055 alpha:0.94];
     self.panel.layer.cornerRadius = 16.0;
     self.panel.layer.borderWidth = 1.0;
@@ -336,33 +623,51 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     performanceHint.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
     [self.panel addSubview:performanceHint];
 
-    UILabel *scaleLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 108.0, 180.0, 25.0)];
+    UILabel *landscapeLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 108.0, 190.0, 25.0)];
+    landscapeLabel.text = @"Khóa ngang game";
+    landscapeLabel.textColor = UIColor.whiteColor;
+    landscapeLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
+    [self.panel addSubview:landscapeLabel];
+
+    self.landscapeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(228.0, 104.0, 51.0, 31.0)];
+    self.landscapeSwitch.onTintColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.0 alpha:1.0];
+    [self.landscapeSwitch addTarget:self
+                             action:@selector(landscapeSwitchChanged:)
+                   forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:self.landscapeSwitch];
+
+    self.landscapeHintLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 135.0, 264.0, 19.0)];
+    self.landscapeHintLabel.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
+    self.landscapeHintLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
+    [self.panel addSubview:self.landscapeHintLabel];
+
+    UILabel *scaleLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 164.0, 180.0, 25.0)];
     scaleLabel.text = @"Độ phân giải app";
     scaleLabel.textColor = UIColor.whiteColor;
     scaleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
     [self.panel addSubview:scaleLabel];
 
-    self.scaleValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(218.0, 108.0, 64.0, 25.0)];
+    self.scaleValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(218.0, 164.0, 64.0, 25.0)];
     self.scaleValueLabel.textColor = [UIColor colorWithRed:0.25 green:0.76 blue:1.0 alpha:1.0];
     self.scaleValueLabel.textAlignment = NSTextAlignmentRight;
     self.scaleValueLabel.font = [UIFont monospacedDigitSystemFontOfSize:15.0 weight:UIFontWeightSemibold];
     [self.panel addSubview:self.scaleValueLabel];
 
-    self.scaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(18.0, 137.0, 264.0, 30.0)];
-    self.scaleSlider.minimumValue = 0.5f;
+    self.scaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(18.0, 193.0, 264.0, 30.0)];
+    self.scaleSlider.minimumValue = 0.1f;
     self.scaleSlider.maximumValue = 1.0f;
     self.scaleSlider.minimumTrackTintColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.0 alpha:1.0];
     [self.scaleSlider addTarget:self action:@selector(scaleSliderChanged:)
                forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.scaleSlider];
 
-    self.scaleHintLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 169.0, 264.0, 18.0)];
+    self.scaleHintLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 225.0, 264.0, 18.0)];
     self.scaleHintLabel.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
     self.scaleHintLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
     [self.panel addSubview:self.scaleHintLabel];
 
     UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    resetButton.frame = CGRectMake(18.0, 198.0, 264.0, 32.0);
+    resetButton.frame = CGRectMake(18.0, 252.0, 264.0, 32.0);
     resetButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
     resetButton.layer.cornerRadius = 8.0;
     resetButton.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
@@ -382,6 +687,34 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 
+- (BOOL)shouldAutorotate {
+    return YES;
+}
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return GBShouldKeepLandscape() ? GBLandscapeMask() : GBHostOrientationMask();
+}
+
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    if (GBShouldKeepLandscape()) {
+        return GBPreferredLandscapeOrientation();
+    }
+
+    UIWindow *hostWindow = GBHostApplicationWindow();
+    UIViewController *hostController =
+        GBTopViewController(hostWindow.rootViewController);
+    UIInterfaceOrientation preferred =
+        hostController.preferredInterfaceOrientationForPresentation;
+    const UIInterfaceOrientationMask mask = GBHostOrientationMask();
+    if (GBMaskContainsOrientation(mask, preferred)) {
+        return preferred;
+    }
+    if ((mask & UIInterfaceOrientationMaskPortrait) != 0) {
+        return UIInterfaceOrientationPortrait;
+    }
+    return GBPreferredLandscapeOrientation();
+}
+
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     if (!self.hasInitialButtonPosition) {
@@ -394,6 +727,11 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
 - (void)settingsDidChange {
     self.performanceSwitch.on = gPerformanceEnabled.load(std::memory_order_relaxed);
+    self.landscapeSwitch.on =
+        gLandscapeLockEnabled.load(std::memory_order_relaxed);
+    self.landscapeHintLabel.text = GBAppIsLandscapeOnly()
+        ? @"Game chỉ hỗ trợ ngang • GameBoost tự giữ đúng hướng"
+        : @"Vẫn nằm ngang khi bật khóa xoay của hệ thống";
     const double activeScale = gResolutionScale.load(std::memory_order_relaxed);
     const double configuredScale =
         gConfiguredResolutionScale.load(std::memory_order_relaxed);
@@ -407,9 +745,13 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         self.scaleValueLabel.text =
             [NSString stringWithFormat:@"%.0f%%", configuredScale * 100.0];
     }
-    self.scaleHintLabel.text = needsRelaunch
-        ? @"Đã lưu • đóng/mở lại app để áp dụng an toàn"
-        : @"Giảm pixel thật • giữ nguyên khung hình, không zoom";
+    if (needsRelaunch) {
+        self.scaleHintLabel.text = @"Đã lưu • đóng/mở lại app để áp dụng an toàn";
+    } else if (configuredScale <= 0.25) {
+        self.scaleHintLabel.text = @"10–25% rất mờ • menu vẫn giữ độ nét gốc";
+    } else {
+        self.scaleHintLabel.text = @"Giảm pixel thật • giữ nguyên khung hình, không zoom";
+    }
 }
 
 - (void)togglePanel {
@@ -425,6 +767,10 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
 - (void)performanceSwitchChanged:(UISwitch *)sender {
     GBSetPerformanceEnabled(sender.isOn, YES);
+}
+
+- (void)landscapeSwitchChanged:(UISwitch *)sender {
+    GBSetLandscapeLockEnabled(sender.isOn, YES);
 }
 
 - (void)scaleSliderChanged:(UISlider *)sender {
@@ -461,7 +807,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     CGRect safeBounds = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
     const CGFloat margin = 12.0;
     const CGFloat panelWidth = MIN(300.0, MAX(260.0, CGRectGetWidth(safeBounds) - margin * 2.0));
-    const CGFloat panelHeight = 242.0;
+    const CGFloat panelHeight = 294.0;
     CGFloat x = CGRectGetMaxX(self.menuButton.frame) + 10.0;
     if (x + panelWidth > CGRectGetMaxX(safeBounds) - margin) {
         x = CGRectGetMinX(self.menuButton.frame) - panelWidth - 10.0;
@@ -543,6 +889,28 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 @end
 
 
+%hook UIApplication
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientationsForWindow:(UIWindow *)window {
+    UIInterfaceOrientationMask originalMask = %orig(window);
+    if (GBShouldKeepLandscape()) {
+        UIWindow *hostWindow = GBHostApplicationWindow();
+        UIViewController *topController =
+            GBTopViewController(hostWindow.rootViewController);
+        GBInstallControllerOrientationOverrides(hostWindow.rootViewController);
+        GBInstallControllerOrientationOverrides(topController);
+        return GBLandscapeMask();
+    }
+    if (GBIsOverlayWindow(window)) {
+        UIInterfaceOrientationMask hostMask = GBHostOrientationMask();
+        return hostMask != 0 ? hostMask : originalMask;
+    }
+    return originalMask;
+}
+
+%end
+
+
 %hook UIScreen
 
 - (CGFloat)scale {
@@ -550,7 +918,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     if (self != gMainScreen) {
         originalScale = %orig;
     }
-    return MAX(0.5, originalScale *
+    return MAX(0.1, originalScale *
         (CGFloat)gResolutionScale.load(std::memory_order_relaxed));
 }
 
@@ -559,7 +927,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     if (self != gMainScreen) {
         originalScale = %orig;
     }
-    return MAX(0.5, originalScale *
+    return MAX(0.1, originalScale *
         (CGFloat)gResolutionScale.load(std::memory_order_relaxed));
 }
 
@@ -665,12 +1033,14 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
             ? 1.0
             : [defaults doubleForKey:GBResolutionScaleKey];
         BOOL savedPerformance = [defaults boolForKey:GBPerformanceKey];
+        BOOL savedLandscapeLock = [defaults boolForKey:GBLandscapeLockKey];
 
         const double initialScale = GBClampScale(savedScale);
         gResolutionScale.store(initialScale, std::memory_order_relaxed);
         gConfiguredResolutionScale.store(initialScale, std::memory_order_relaxed);
         gPerformanceEnabled.store(savedPerformance && GBThermalStateAllowsBoost(),
                                   std::memory_order_relaxed);
+        gLandscapeLockEnabled.store(savedLandscapeLock, std::memory_order_relaxed);
 
         %init;
 
@@ -680,6 +1050,9 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
                                                     usingBlock:^(__unused NSNotification *notification) {
             [[OAGameBoostOverlayManager sharedManager] installIfPossible];
             GBRefreshApplicationResolution();
+            if (GBShouldKeepLandscape()) {
+                GBRequestOrientationUpdate();
+            }
         }];
 
         [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification
@@ -696,6 +1069,9 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
             GBUpdateProcessActivity(gPerformanceEnabled.load(std::memory_order_relaxed));
             [[OAGameBoostOverlayManager sharedManager] installIfPossible];
             GBRefreshApplicationResolution();
+            if (GBShouldKeepLandscape()) {
+                GBRequestOrientationUpdate();
+            }
         });
     }
 }
