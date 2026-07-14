@@ -59,18 +59,27 @@ jobs:
             '%hook UIScreen' \
             '%hook UIScreenMode' \
             '%hook MTKView' \
+            '%hook CADisplayLink' \
             '%hook CAMetalLayer' \
+            '%hook MTLSamplerDescriptor' \
+            'GBModuleModeEnhanceGraphics' \
+            'GBSetModuleMode' \
             'GBLandscapeLockKey' \
             'supportedInterfaceOrientationsForWindow' \
             'requestGeometryUpdateWithPreferences' \
             'GBPreferredLandscapeOrientation' \
             'self.landscapeSwitch' \
             'gConfiguredResolutionScale.exchange' \
+            'gConfiguredGraphicsScale.exchange' \
             'metalView.drawableSize = targetSize' \
             'self.scaleSlider.minimumValue = 0.1f' \
-            'self.scaleSlider.maximumValue = 1.0f'; do
+            'self.scaleSlider.maximumValue = 1.0f' \
+            'self.graphicsScaleSlider.maximumValue = 1.5f' \
+            'self.gameScroll.userInteractionEnabled' \
+            'GBLiquidGlassKey' \
+            'GBApplyMetalLayerOptions'; do
             if ! grep -Fq "$source_marker" Tweak.xm; then
-              echo "Missing app-resolution implementation marker: $source_marker" >&2
+              echo "Missing GameBoost v2 implementation marker: $source_marker" >&2
               exit 1
             fi
           done
@@ -80,8 +89,18 @@ jobs:
             exit 1
           fi
 
+          if grep -Fq 'NSProcessInfoThermalStateDidChangeNotification' Tweak.xm; then
+            echo "Performance QoS must not be auto-disabled by thermal notifications" >&2
+            exit 1
+          fi
+
           if ! grep -Eq '^GameBoost_FRAMEWORKS.*MetalKit' Makefile; then
             echo "MetalKit must be linked for MTKView drawable-size synchronization" >&2
+            exit 1
+          fi
+
+          if ! grep -Eq '^GameBoost_FRAMEWORKS.*[[:space:]]Metal([[:space:]]|$)' Makefile; then
+            echo "Metal must be linked for sampler descriptor overrides" >&2
             exit 1
           fi
 
@@ -160,6 +179,10 @@ jobs:
 
           if ! otool -L "$dylib_path" | grep -Fq '/System/Library/Frameworks/MetalKit.framework/MetalKit'; then
             echo "Built dylib is not linked against MetalKit" >&2
+            exit 1
+          fi
+          if ! otool -L "$dylib_path" | grep -Fq '/System/Library/Frameworks/Metal.framework/Metal'; then
+            echo "Built dylib is not linked against Metal" >&2
             exit 1
           fi
 
