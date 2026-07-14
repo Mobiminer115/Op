@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <Metal/Metal.h>
 #import <MetalKit/MTKView.h>
 #import <pthread/qos.h>
 #import <objc/runtime.h>
@@ -8,40 +9,140 @@
 #include <atomic>
 #include <cmath>
 
+typedef NS_ENUM(NSInteger, GBModuleMode) {
+    GBModuleModeNone = 0,
+    GBModuleModeGameBoost = 1,
+    GBModuleModeEnhanceGraphics = 2,
+};
+
+static NSString * const GBModuleModeKey = @"com.gameboost.universal.module-mode";
 static NSString * const GBPerformanceKey = @"com.gameboost.universal.performance-enabled";
 static NSString * const GBResolutionScaleKey = @"com.gameboost.universal.resolution-scale";
 static NSString * const GBLandscapeLockKey = @"com.gameboost.universal.landscape-lock-enabled";
+static NSString * const GBFrameRateKey = @"com.gameboost.universal.frame-rate";
+static NSString * const GBLowLatencyKey = @"com.gameboost.universal.low-latency";
+static NSString * const GBKeepAwakeKey = @"com.gameboost.universal.keep-awake";
+static NSString * const GBGraphicsScaleKey = @"com.gameboost.universal.graphics-scale";
+static NSString * const GBLinearFilteringKey = @"com.gameboost.universal.linear-filtering";
+static NSString * const GBTrilinearFilteringKey = @"com.gameboost.universal.trilinear-filtering";
+static NSString * const GBAnisotropyKey = @"com.gameboost.universal.anisotropy";
+static NSString * const GBWideColorKey = @"com.gameboost.universal.wide-color";
+static NSString * const GBHighQualityScalingKey = @"com.gameboost.universal.high-quality-scaling";
+static NSString * const GBMenuScaleKey = @"com.gameboost.universal.menu-scale";
+static NSString * const GBMenuDragKey = @"com.gameboost.universal.menu-drag";
+static NSString * const GBMenuHueKey = @"com.gameboost.universal.menu-hue";
+static NSString * const GBMenuOpacityKey = @"com.gameboost.universal.menu-opacity";
+static NSString * const GBLiquidGlassKey = @"com.gameboost.universal.liquid-glass";
 static NSString * const GBSettingsDidChangeNotification = @"com.gameboost.universal.settings-changed";
 
+static std::atomic<int> gModuleMode((int)GBModuleModeNone);
+static GBModuleMode gLaunchedModuleMode = GBModuleModeNone;
 static std::atomic_bool gPerformanceEnabled(false);
 static std::atomic_bool gLandscapeLockEnabled(false);
+static std::atomic<int> gFrameRate(0);
+static std::atomic_bool gLowLatencyEnabled(false);
+static std::atomic_bool gKeepAwakeEnabled(false);
+static std::atomic_bool gLinearFilteringEnabled(true);
+static std::atomic_bool gTrilinearFilteringEnabled(true);
+static std::atomic<int> gAnisotropyLevel(4);
+static std::atomic_bool gWideColorEnabled(false);
+static std::atomic_bool gHighQualityScalingEnabled(true);
+static std::atomic<double> gConfiguredGraphicsScale(1.0);
+static std::atomic<double> gMenuScale(1.0);
+static std::atomic_bool gMenuDragEnabled(true);
+static std::atomic<double> gMenuHue(0.55);
+static std::atomic<double> gMenuOpacity(0.96);
+static std::atomic_bool gLiquidGlassEnabled(true);
 // gResolutionScale is the scale currently active in the renderer. The menu
-// writes gConfiguredResolutionScale; it becomes active on the next app launch
-// so engines that cache their viewport never see a half-updated frame.
+// writes one of the configured scales; the selected module and scale become
+// active on the next app launch so cached engine viewports never half-update.
 static std::atomic<double> gResolutionScale(1.0);
 static std::atomic<double> gConfiguredResolutionScale(1.0);
 static id gProcessActivity = nil;
+static BOOL gIdleTimerOverrideActive = NO;
+static BOOL gOriginalIdleTimerDisabled = NO;
+static NSHashTable<CADisplayLink *> *gDisplayLinks = nil;
 static UIScreen *gMainScreen = nil;
 static UIScreenMode *gMainScreenMode = nil;
 static CGFloat gOriginalMainScreenScale = 1.0;
 static CGFloat gOriginalMainNativeScale = 1.0;
 static CGRect gOriginalMainNativeBounds = CGRectZero;
 static CGSize gOriginalMainScreenModeSize = CGSizeZero;
+static NSInteger gMaximumFramesPerSecond = 60;
 
 static const void *GBMetalKitManagedLayerKey = &GBMetalKitManagedLayerKey;
 static const void *GBOverlayWindowKey = &GBOverlayWindowKey;
+static const void *GBOriginalDisplayLinkFPSKey = &GBOriginalDisplayLinkFPSKey;
+static const void *GBOriginalMTKViewFPSKey = &GBOriginalMTKViewFPSKey;
+static const void *GBOriginalDrawableCountKey = &GBOriginalDrawableCountKey;
+static const void *GBOriginalMetalColorSpaceKey = &GBOriginalMetalColorSpaceKey;
+static const void *GBOriginalMinificationFilterKey = &GBOriginalMinificationFilterKey;
+static const void *GBOriginalMagnificationFilterKey = &GBOriginalMagnificationFilterKey;
+static const void *GBRequestedSamplerMinKey = &GBRequestedSamplerMinKey;
+static const void *GBRequestedSamplerMagKey = &GBRequestedSamplerMagKey;
+static const void *GBRequestedSamplerMipKey = &GBRequestedSamplerMipKey;
+static const void *GBRequestedSamplerAnisotropyKey = &GBRequestedSamplerAnisotropyKey;
 static const void *GBOrientationMaskOverrideKey = &GBOrientationMaskOverrideKey;
 static const void *GBAutorotateOverrideKey = &GBAutorotateOverrideKey;
 static const void *GBPreferredOrientationOverrideKey = &GBPreferredOrientationOverrideKey;
 
-static double GBClampScale(double scale) {
+static thread_local BOOL gApplyingDisplayLinkFPS = NO;
+static thread_local BOOL gApplyingMTKViewFPS = NO;
+static thread_local BOOL gApplyingSamplerSettings = NO;
+static thread_local BOOL gApplyingIdleTimerOverride = NO;
+
+static GBModuleMode GBCurrentModuleMode(void) {
+    return (GBModuleMode)gModuleMode.load(std::memory_order_relaxed);
+}
+
+static BOOL GBIsGameBoostActive(void) {
+    return GBCurrentModuleMode() == GBModuleModeGameBoost;
+}
+
+static BOOL GBIsEnhanceGraphicsActive(void) {
+    return GBCurrentModuleMode() == GBModuleModeEnhanceGraphics;
+}
+
+static double GBClampGameScale(double scale) {
     if (!std::isfinite(scale)) {
         return 1.0;
     }
-    // This control is a performance/downscale control. Values above 1.0 are
-    // deliberately rejected so it cannot turn into display zoom or expensive
-    // supersampling.
     return fmin(1.0, fmax(0.1, scale));
+}
+
+static double GBClampGraphicsScale(double scale) {
+    if (!std::isfinite(scale)) {
+        return 1.0;
+    }
+    return fmin(1.5, fmax(1.0, scale));
+}
+
+static double GBClampMenuScale(double scale) {
+    if (!std::isfinite(scale)) {
+        return 1.0;
+    }
+    return fmin(1.25, fmax(0.75, scale));
+}
+
+static double GBClampUnit(double value, double fallback) {
+    if (!std::isfinite(value)) {
+        return fallback;
+    }
+    return fmin(1.0, fmax(0.0, value));
+}
+
+static int GBSanitizeFrameRate(NSInteger frameRate) {
+    return frameRate == 30 || frameRate == 60 || frameRate == 120
+        ? (int)frameRate
+        : 0;
+}
+
+static int GBSanitizeAnisotropy(NSInteger level) {
+    if (level >= 16) return 16;
+    if (level >= 8) return 8;
+    if (level >= 4) return 4;
+    if (level >= 2) return 2;
+    return 1;
 }
 
 static BOOL GBIsUsableSize(CGSize size) {
@@ -66,8 +167,12 @@ static CGSize GBPixelSizeForBounds(CGSize boundsSize) {
 
 static BOOL GBShouldLoadInCurrentProcess(void) {
     NSBundle *mainBundle = NSBundle.mainBundle;
-    NSString *bundlePath = mainBundle.bundlePath ?: @"";
-    NSString *bundleIdentifier = mainBundle.bundleIdentifier ?: @"";
+    NSString *bundlePath = mainBundle.bundlePath != nil
+        ? mainBundle.bundlePath
+        : @"";
+    NSString *bundleIdentifier = mainBundle.bundleIdentifier != nil
+        ? mainBundle.bundleIdentifier
+        : @"";
 
     // The com.apple.UIKit filter also matches SpringBoard, app extensions and
     // several UIKit helper processes. This tweak owns a UIWindow, so only run
@@ -79,11 +184,6 @@ static BOOL GBShouldLoadInCurrentProcess(void) {
     BOOL hasUIApplication = NSClassFromString(@"UIApplication") != Nil;
 
     return isRegularApplication && !isSpringBoard && hasUIApplication;
-}
-
-static BOOL GBThermalStateAllowsBoost(void) {
-    NSProcessInfoThermalState state = NSProcessInfo.processInfo.thermalState;
-    return state < NSProcessInfoThermalStateSerious;
 }
 
 static void GBPostSettingsChanged(void) {
@@ -113,12 +213,8 @@ static void GBUpdateProcessActivity(BOOL enabled) {
 }
 
 static void GBSetPerformanceEnabled(BOOL enabled, BOOL persist) {
-    if (enabled && !GBThermalStateAllowsBoost()) {
-        enabled = NO;
-    }
-
     gPerformanceEnabled.store(enabled, std::memory_order_relaxed);
-    GBUpdateProcessActivity(enabled);
+    GBUpdateProcessActivity(enabled && GBIsGameBoostActive());
 
     if (persist) {
         [NSUserDefaults.standardUserDefaults setBool:enabled forKey:GBPerformanceKey];
@@ -131,7 +227,8 @@ static void GBApplyQoSToCurrentRenderThread(void) {
     static thread_local qos_class_t previousClass = QOS_CLASS_UNSPECIFIED;
     static thread_local int previousRelativePriority = 0;
 
-    const BOOL shouldPromote = gPerformanceEnabled.load(std::memory_order_relaxed);
+    const BOOL shouldPromote = GBIsGameBoostActive() &&
+        gPerformanceEnabled.load(std::memory_order_relaxed);
     if (shouldPromote && !promoted) {
         qos_class_t detectedClass = QOS_CLASS_UNSPECIFIED;
         int detectedRelativePriority = 0;
@@ -169,7 +266,7 @@ static NSArray<UIWindow *> *GBApplicationWindows(void) {
     }
     NSArray<UIWindow *> *legacyWindows =
         [UIApplication.sharedApplication valueForKey:@"windows"];
-    return legacyWindows ?: @[];
+    return legacyWindows != nil ? legacyWindows : @[];
 }
 
 static BOOL GBIsOverlayWindow(UIWindow *window) {
@@ -268,7 +365,8 @@ static BOOL GBAppIsLandscapeOnly(void) {
 }
 
 static BOOL GBShouldKeepLandscape(void) {
-    return gLandscapeLockEnabled.load(std::memory_order_relaxed) ||
+    return (GBIsGameBoostActive() &&
+            gLandscapeLockEnabled.load(std::memory_order_relaxed)) ||
            GBAppIsLandscapeOnly();
 }
 
@@ -513,8 +611,8 @@ static void GBRefreshApplicationResolution(void) {
     }
 }
 
-static void GBSetResolutionScale(double scale, BOOL persist) {
-    scale = GBClampScale(scale);
+static void GBSetGameResolutionScale(double scale, BOOL persist) {
+    scale = GBClampGameScale(scale);
     const double oldScale =
         gConfiguredResolutionScale.exchange(scale, std::memory_order_relaxed);
 
@@ -527,6 +625,327 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         [NSUserDefaults.standardUserDefaults synchronize];
     }
     GBPostSettingsChanged();
+}
+
+static void GBSetGraphicsResolutionScale(double scale, BOOL persist) {
+    scale = GBClampGraphicsScale(scale);
+    const double oldScale =
+        gConfiguredGraphicsScale.exchange(scale, std::memory_order_relaxed);
+    if (fabs(oldScale - scale) < 0.001) {
+        return;
+    }
+    if (persist) {
+        [NSUserDefaults.standardUserDefaults setDouble:scale forKey:GBGraphicsScaleKey];
+        [NSUserDefaults.standardUserDefaults synchronize];
+    }
+    GBPostSettingsChanged();
+}
+
+static NSInteger GBEffectiveFrameRate(NSInteger requestedFrameRate) {
+    if (!GBIsGameBoostActive()) {
+        return requestedFrameRate;
+    }
+    NSInteger selected = gFrameRate.load(std::memory_order_relaxed);
+    if (selected <= 0) {
+        return requestedFrameRate;
+    }
+    return MIN(selected, gMaximumFramesPerSecond);
+}
+
+static void GBApplyFrameRateToViewTree(UIView *view) {
+    if ([view isKindOfClass:MTKView.class]) {
+        MTKView *metalView = (MTKView *)view;
+        NSNumber *original = objc_getAssociatedObject(metalView, GBOriginalMTKViewFPSKey);
+        if (original == nil) {
+            original = @(metalView.preferredFramesPerSecond);
+            objc_setAssociatedObject(metalView,
+                                     GBOriginalMTKViewFPSKey,
+                                     original,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        gApplyingMTKViewFPS = YES;
+        metalView.preferredFramesPerSecond =
+            GBEffectiveFrameRate(original.integerValue);
+        gApplyingMTKViewFPS = NO;
+    }
+    for (UIView *subview in view.subviews.copy) {
+        GBApplyFrameRateToViewTree(subview);
+    }
+}
+
+static void GBRegisterDisplayLink(CADisplayLink *displayLink) {
+    if (displayLink == nil) {
+        return;
+    }
+    @synchronized (gDisplayLinks) {
+        [gDisplayLinks addObject:displayLink];
+    }
+    NSNumber *original = objc_getAssociatedObject(displayLink,
+                                                   GBOriginalDisplayLinkFPSKey);
+    if (original == nil) {
+        original = @(displayLink.preferredFramesPerSecond);
+        objc_setAssociatedObject(displayLink,
+                                 GBOriginalDisplayLinkFPSKey,
+                                 original,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    gApplyingDisplayLinkFPS = YES;
+    displayLink.preferredFramesPerSecond =
+        GBEffectiveFrameRate(original.integerValue);
+    gApplyingDisplayLinkFPS = NO;
+}
+
+static void GBRefreshFrameRateTargets(void) {
+    dispatch_block_t refresh = ^{
+        NSArray<CADisplayLink *> *links = nil;
+        @synchronized (gDisplayLinks) {
+            links = gDisplayLinks.allObjects;
+        }
+        for (CADisplayLink *displayLink in links) {
+            NSNumber *original = objc_getAssociatedObject(displayLink,
+                                                           GBOriginalDisplayLinkFPSKey);
+            gApplyingDisplayLinkFPS = YES;
+            displayLink.preferredFramesPerSecond =
+                GBEffectiveFrameRate(original.integerValue);
+            gApplyingDisplayLinkFPS = NO;
+        }
+        for (UIWindow *window in GBApplicationWindows()) {
+            if (!GBIsOverlayWindow(window)) {
+                GBApplyFrameRateToViewTree(window);
+            }
+        }
+    };
+    if (NSThread.isMainThread) {
+        refresh();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), refresh);
+    }
+}
+
+static CGColorSpaceRef GBDisplayP3ColorSpace(void) {
+    static CGColorSpaceRef colorSpace = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+    });
+    return colorSpace;
+}
+
+static void GBApplyMetalLayerOptions(CAMetalLayer *layer) {
+    const BOOL boostLowLatency = GBIsGameBoostActive() &&
+        gLowLatencyEnabled.load(std::memory_order_relaxed);
+    NSNumber *originalDrawableCount =
+        objc_getAssociatedObject(layer, GBOriginalDrawableCountKey);
+    if (boostLowLatency) {
+        if (originalDrawableCount == nil) {
+            objc_setAssociatedObject(layer,
+                                     GBOriginalDrawableCountKey,
+                                     @(layer.maximumDrawableCount),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (layer.maximumDrawableCount != 2) {
+            layer.maximumDrawableCount = 2;
+        }
+    } else if (originalDrawableCount != nil) {
+        layer.maximumDrawableCount = MAX(2, originalDrawableCount.integerValue);
+        objc_setAssociatedObject(layer,
+                                 GBOriginalDrawableCountKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    const BOOL graphicsActive = GBIsEnhanceGraphicsActive();
+    const BOOL useWideColor = graphicsActive &&
+        gWideColorEnabled.load(std::memory_order_relaxed);
+    id originalColorSpace = objc_getAssociatedObject(layer,
+                                                      GBOriginalMetalColorSpaceKey);
+    if (useWideColor) {
+        if (originalColorSpace == nil) {
+            CGColorSpaceRef current = layer.colorspace;
+            objc_setAssociatedObject(layer,
+                                     GBOriginalMetalColorSpaceKey,
+                                     current != NULL ? (__bridge id)current : NSNull.null,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        CGColorSpaceRef displayP3 = GBDisplayP3ColorSpace();
+        if (displayP3 != NULL) {
+            layer.colorspace = displayP3;
+        }
+    } else if (originalColorSpace != nil) {
+        layer.colorspace = originalColorSpace == NSNull.null
+            ? NULL
+            : (__bridge CGColorSpaceRef)originalColorSpace;
+        objc_setAssociatedObject(layer,
+                                 GBOriginalMetalColorSpaceKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    const BOOL useHighQualityScaling = graphicsActive &&
+        gHighQualityScalingEnabled.load(std::memory_order_relaxed);
+    id originalMinFilter = objc_getAssociatedObject(layer,
+                                                     GBOriginalMinificationFilterKey);
+    id originalMagFilter = objc_getAssociatedObject(layer,
+                                                     GBOriginalMagnificationFilterKey);
+    if (useHighQualityScaling) {
+        if (originalMinFilter == nil) {
+            objc_setAssociatedObject(layer,
+                                     GBOriginalMinificationFilterKey,
+                                     layer.minificationFilter != nil
+                                         ? layer.minificationFilter
+                                         : NSNull.null,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(layer,
+                                     GBOriginalMagnificationFilterKey,
+                                     layer.magnificationFilter != nil
+                                         ? layer.magnificationFilter
+                                         : NSNull.null,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        layer.minificationFilter = kCAFilterTrilinear;
+        layer.magnificationFilter = kCAFilterLinear;
+    } else if (originalMinFilter != nil || originalMagFilter != nil) {
+        layer.minificationFilter = originalMinFilter == NSNull.null
+            ? kCAFilterLinear
+            : originalMinFilter;
+        layer.magnificationFilter = originalMagFilter == NSNull.null
+            ? kCAFilterLinear
+            : originalMagFilter;
+        objc_setAssociatedObject(layer,
+                                 GBOriginalMinificationFilterKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(layer,
+                                 GBOriginalMagnificationFilterKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void GBApplyMetalOptionsToLayerTree(CALayer *layer) {
+    if ([layer isKindOfClass:CAMetalLayer.class]) {
+        GBApplyMetalLayerOptions((CAMetalLayer *)layer);
+    }
+    for (CALayer *sublayer in layer.sublayers.copy) {
+        GBApplyMetalOptionsToLayerTree(sublayer);
+    }
+}
+
+static void GBRefreshMetalOptions(void) {
+    dispatch_block_t refresh = ^{
+        for (UIWindow *window in GBApplicationWindows()) {
+            if (!GBIsOverlayWindow(window)) {
+                GBApplyMetalOptionsToLayerTree(window.layer);
+            }
+        }
+    };
+    if (NSThread.isMainThread) {
+        refresh();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), refresh);
+    }
+}
+
+static void GBUpdateIdleTimerOverride(void) {
+    dispatch_block_t update = ^{
+        UIApplication *application = UIApplication.sharedApplication;
+        const BOOL shouldKeepAwake = GBIsGameBoostActive() &&
+            gKeepAwakeEnabled.load(std::memory_order_relaxed);
+        if (shouldKeepAwake && !gIdleTimerOverrideActive) {
+            gOriginalIdleTimerDisabled = application.idleTimerDisabled;
+            gApplyingIdleTimerOverride = YES;
+            application.idleTimerDisabled = YES;
+            gApplyingIdleTimerOverride = NO;
+            gIdleTimerOverrideActive = YES;
+        } else if (!shouldKeepAwake && gIdleTimerOverrideActive) {
+            gApplyingIdleTimerOverride = YES;
+            application.idleTimerDisabled = gOriginalIdleTimerDisabled;
+            gApplyingIdleTimerOverride = NO;
+            gIdleTimerOverrideActive = NO;
+        }
+    };
+    if (NSThread.isMainThread) {
+        update();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), update);
+    }
+}
+
+static void GBSetModuleMode(GBModuleMode mode, BOOL persist) {
+    if (mode != GBModuleModeNone &&
+        mode != GBModuleModeGameBoost &&
+        mode != GBModuleModeEnhanceGraphics) {
+        mode = GBModuleModeNone;
+    }
+    GBModuleMode oldMode = (GBModuleMode)gModuleMode.exchange((int)mode,
+                                                              std::memory_order_relaxed);
+    if (persist) {
+        [NSUserDefaults.standardUserDefaults setInteger:mode forKey:GBModuleModeKey];
+        [NSUserDefaults.standardUserDefaults synchronize];
+    }
+    GBUpdateProcessActivity(GBIsGameBoostActive() &&
+        gPerformanceEnabled.load(std::memory_order_relaxed));
+    GBUpdateIdleTimerOverride();
+    GBRefreshFrameRateTargets();
+    GBRefreshMetalOptions();
+    GBPostSettingsChanged();
+    if (oldMode != mode) {
+        GBRequestOrientationUpdate();
+    }
+}
+
+static void GBSetFrameRate(NSInteger frameRate, BOOL persist) {
+    const int sanitized = GBSanitizeFrameRate(frameRate);
+    gFrameRate.store(sanitized, std::memory_order_relaxed);
+    if (persist) {
+        [NSUserDefaults.standardUserDefaults setInteger:sanitized forKey:GBFrameRateKey];
+    }
+    GBRefreshFrameRateTargets();
+    GBPostSettingsChanged();
+}
+
+static void GBSetLowLatencyEnabled(BOOL enabled, BOOL persist) {
+    gLowLatencyEnabled.store(enabled, std::memory_order_relaxed);
+    if (persist) {
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:GBLowLatencyKey];
+    }
+    GBRefreshMetalOptions();
+    GBPostSettingsChanged();
+}
+
+static void GBSetKeepAwakeEnabled(BOOL enabled, BOOL persist) {
+    gKeepAwakeEnabled.store(enabled, std::memory_order_relaxed);
+    if (persist) {
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:GBKeepAwakeKey];
+    }
+    GBUpdateIdleTimerOverride();
+    GBPostSettingsChanged();
+}
+
+static void GBSetGraphicsBoolean(std::atomic_bool &storage,
+                                 NSString *key,
+                                 BOOL enabled,
+                                 BOOL refreshMetal) {
+    storage.store(enabled, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:key];
+    if (refreshMetal) {
+        GBRefreshMetalOptions();
+    }
+    GBPostSettingsChanged();
+}
+
+static void GBSetAnisotropy(NSInteger level) {
+    const int sanitized = GBSanitizeAnisotropy(level);
+    gAnisotropyLevel.store(sanitized, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setInteger:sanitized forKey:GBAnisotropyKey];
+    GBPostSettingsChanged();
+}
+
+static UIColor *GBThemeColor(void) {
+    return [UIColor colorWithHue:(CGFloat)gMenuHue.load(std::memory_order_relaxed)
+                      saturation:0.82
+                      brightness:1.0
+                           alpha:1.0];
 }
 
 @interface OAGameBoostPassthroughWindow : UIWindow
@@ -548,139 +967,498 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
 @end
 
-@interface OAGameBoostOverlayViewController : UIViewController
+
+@interface OAGameBoostOverlayViewController : UIViewController <UIGestureRecognizerDelegate>
 @property(nonatomic, strong) UIButton *menuButton;
 @property(nonatomic, strong) UIView *panel;
+@property(nonatomic, strong) UIVisualEffectView *glassView;
+@property(nonatomic, strong) UIView *shineView;
+@property(nonatomic, strong) CAGradientLayer *shineGradient;
+@property(nonatomic, strong) UIView *sidebar;
+@property(nonatomic, strong) UIView *gameTabRow;
+@property(nonatomic, strong) UIView *graphicsTabRow;
+@property(nonatomic, strong) UIView *settingsTabRow;
+@property(nonatomic, strong) UIButton *gameTabButton;
+@property(nonatomic, strong) UIButton *graphicsTabButton;
+@property(nonatomic, strong) UIButton *settingsTabButton;
+@property(nonatomic, strong) UISwitch *gameMasterSwitch;
+@property(nonatomic, strong) UISwitch *graphicsMasterSwitch;
+@property(nonatomic, strong) UIButton *closeButton;
+@property(nonatomic, strong) UIScrollView *gameScroll;
+@property(nonatomic, strong) UIScrollView *graphicsScroll;
+@property(nonatomic, strong) UIScrollView *settingsScroll;
+@property(nonatomic, strong) UILabel *gameStatusLabel;
+@property(nonatomic, strong) UILabel *graphicsStatusLabel;
 @property(nonatomic, strong) UISwitch *performanceSwitch;
+@property(nonatomic, strong) UISwitch *lowLatencySwitch;
+@property(nonatomic, strong) UISwitch *keepAwakeSwitch;
 @property(nonatomic, strong) UISwitch *landscapeSwitch;
 @property(nonatomic, strong) UILabel *landscapeHintLabel;
+@property(nonatomic, strong) UISegmentedControl *fpsControl;
 @property(nonatomic, strong) UISlider *scaleSlider;
 @property(nonatomic, strong) UILabel *scaleValueLabel;
 @property(nonatomic, strong) UILabel *scaleHintLabel;
+@property(nonatomic, strong) UISlider *graphicsScaleSlider;
+@property(nonatomic, strong) UILabel *graphicsScaleValueLabel;
+@property(nonatomic, strong) UILabel *graphicsScaleHintLabel;
+@property(nonatomic, strong) UISwitch *linearFilteringSwitch;
+@property(nonatomic, strong) UISwitch *trilinearFilteringSwitch;
+@property(nonatomic, strong) UISlider *anisotropySlider;
+@property(nonatomic, strong) UILabel *anisotropyValueLabel;
+@property(nonatomic, strong) UISwitch *wideColorSwitch;
+@property(nonatomic, strong) UISwitch *highQualityScalingSwitch;
+@property(nonatomic, strong) UISlider *menuScaleSlider;
+@property(nonatomic, strong) UILabel *menuScaleValueLabel;
+@property(nonatomic, strong) UISwitch *menuDragSwitch;
+@property(nonatomic, strong) UISlider *hueSlider;
+@property(nonatomic, strong) UISlider *opacitySlider;
+@property(nonatomic, strong) UILabel *opacityValueLabel;
+@property(nonatomic, strong) UISwitch *liquidGlassSwitch;
+@property(nonatomic, strong) UIPanGestureRecognizer *panelPanGesture;
+@property(nonatomic, assign) NSInteger selectedTab;
 @property(nonatomic, assign) BOOL hasInitialButtonPosition;
+@property(nonatomic, assign) BOOL hasPanelPosition;
 @end
 
 @implementation OAGameBoostOverlayViewController
 
+- (UILabel *)labelWithText:(NSString *)text
+                       frame:(CGRect)frame
+                        font:(UIFont *)font
+                       color:(UIColor *)color {
+    UILabel *label = [[UILabel alloc] initWithFrame:frame];
+    label.text = text;
+    label.textColor = color;
+    label.font = font;
+    label.numberOfLines = 0;
+    label.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    return label;
+}
+
+- (UISwitch *)addSwitchRowTo:(UIScrollView *)scroll
+                       title:(NSString *)title
+                        hint:(NSString *)hint
+                           y:(CGFloat)y
+                    selector:(SEL)selector {
+    const CGFloat width = CGRectGetWidth(scroll.bounds);
+    UILabel *titleLabel = [self labelWithText:title
+                                         frame:CGRectMake(16.0, y, width - 92.0, 24.0)
+                                          font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                         color:UIColor.whiteColor];
+    [scroll addSubview:titleLabel];
+
+    UISwitch *toggle = [[UISwitch alloc] initWithFrame:CGRectMake(width - 67.0,
+                                                                  y - 3.0,
+                                                                  51.0,
+                                                                  31.0)];
+    toggle.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [toggle addTarget:self action:selector forControlEvents:UIControlEventValueChanged];
+    [scroll addSubview:toggle];
+
+    UILabel *hintLabel = [self labelWithText:hint
+                                        frame:CGRectMake(16.0, y + 27.0, width - 32.0, 34.0)
+                                         font:[UIFont systemFontOfSize:11.0 weight:UIFontWeightRegular]
+                                        color:[UIColor colorWithWhite:0.69 alpha:1.0]];
+    [scroll addSubview:hintLabel];
+    return toggle;
+}
+
+- (UILabel *)addPageTitle:(NSString *)title to:(UIScrollView *)scroll {
+    UILabel *label = [self labelWithText:title
+                                    frame:CGRectMake(16.0, 12.0,
+                                                     CGRectGetWidth(scroll.bounds) - 74.0,
+                                                     30.0)
+                                     font:[UIFont systemFontOfSize:20.0 weight:UIFontWeightBold]
+                                    color:UIColor.whiteColor];
+    [scroll addSubview:label];
+    return label;
+}
+
+- (UILabel *)addStatusLabelTo:(UIScrollView *)scroll y:(CGFloat)y {
+    UILabel *label = [self labelWithText:@""
+                                    frame:CGRectMake(16.0, y,
+                                                     CGRectGetWidth(scroll.bounds) - 32.0,
+                                                     24.0)
+                                     font:[UIFont systemFontOfSize:11.0 weight:UIFontWeightBold]
+                                    color:UIColor.whiteColor];
+    label.textAlignment = NSTextAlignmentCenter;
+    label.layer.cornerRadius = 8.0;
+    label.layer.masksToBounds = YES;
+    [scroll addSubview:label];
+    return label;
+}
+
+- (UIButton *)sidebarButtonWithTitle:(NSString *)title selector:(SEL)selector {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    button.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+    button.titleLabel.numberOfLines = 2;
+    [button setTitle:title forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
+    return button;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.clearColor;
+    self.selectedTab = GBIsEnhanceGraphicsActive() ? 1 : 0;
 
     self.menuButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.menuButton.frame = CGRectMake(16.0, 96.0, 52.0, 52.0);
-    self.menuButton.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.88];
-    self.menuButton.layer.cornerRadius = 26.0;
-    self.menuButton.layer.borderWidth = 1.0;
-    self.menuButton.layer.borderColor = [UIColor colorWithRed:0.25 green:0.76 blue:1.0 alpha:0.9].CGColor;
-    self.menuButton.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightBold];
+    self.menuButton.frame = CGRectMake(16.0, 96.0, 50.0, 50.0);
+    self.menuButton.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.91];
+    self.menuButton.layer.cornerRadius = 25.0;
+    self.menuButton.layer.borderWidth = 1.2;
+    self.menuButton.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightHeavy];
     self.menuButton.accessibilityLabel = @"Open GameBoost menu";
     [self.menuButton setTitle:@"GB" forState:UIControlStateNormal];
     [self.menuButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [self.menuButton addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
-    [self.menuButton addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                                 action:@selector(dragMenuButton:)]];
+    [self.menuButton addTarget:self action:@selector(togglePanel)
+              forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *buttonPan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragMenuButton:)];
+    buttonPan.delegate = self;
+    [self.menuButton addGestureRecognizer:buttonPan];
     [self.view addSubview:self.menuButton];
 
-    self.panel = [[UIView alloc] initWithFrame:CGRectMake(78.0, 96.0, 300.0, 294.0)];
-    self.panel.backgroundColor = [UIColor colorWithWhite:0.055 alpha:0.94];
-    self.panel.layer.cornerRadius = 16.0;
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake(76.0, 80.0, 480.0, 350.0)];
+    self.panel.layer.cornerRadius = 19.0;
     self.panel.layer.borderWidth = 1.0;
-    self.panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.14].CGColor;
+    self.panel.layer.masksToBounds = YES;
     self.panel.hidden = YES;
     [self.view addSubview:self.panel];
 
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 12.0, 200.0, 28.0)];
-    titleLabel.text = @"GameBoost";
-    titleLabel.textColor = UIColor.whiteColor;
-    titleLabel.font = [UIFont systemFontOfSize:19.0 weight:UIFontWeightSemibold];
-    [self.panel addSubview:titleLabel];
+    UIBlurEffect *blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
+    self.glassView = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
+    self.glassView.userInteractionEnabled = NO;
+    [self.panel addSubview:self.glassView];
 
-    UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeButton.frame = CGRectMake(252.0, 7.0, 40.0, 40.0);
-    closeButton.titleLabel.font = [UIFont systemFontOfSize:23.0 weight:UIFontWeightRegular];
-    closeButton.accessibilityLabel = @"Close GameBoost menu";
-    [closeButton setTitle:@"×" forState:UIControlStateNormal];
-    [closeButton setTitleColor:[UIColor colorWithWhite:0.82 alpha:1.0] forState:UIControlStateNormal];
-    [closeButton addTarget:self action:@selector(hidePanel) forControlEvents:UIControlEventTouchUpInside];
-    [self.panel addSubview:closeButton];
+    self.shineView = [[UIView alloc] initWithFrame:self.panel.bounds];
+    self.shineView.userInteractionEnabled = NO;
+    self.shineGradient = [CAGradientLayer layer];
+    self.shineGradient.startPoint = CGPointMake(0.0, 0.0);
+    self.shineGradient.endPoint = CGPointMake(1.0, 1.0);
+    [self.shineView.layer addSublayer:self.shineGradient];
+    [self.panel addSubview:self.shineView];
 
-    UILabel *performanceLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 52.0, 190.0, 25.0)];
-    performanceLabel.text = @"Performance QoS";
-    performanceLabel.textColor = UIColor.whiteColor;
-    performanceLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
-    [self.panel addSubview:performanceLabel];
+    self.sidebar = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, 130.0, 350.0)];
+    [self.panel addSubview:self.sidebar];
 
-    self.performanceSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(228.0, 48.0, 51.0, 31.0)];
-    self.performanceSwitch.onTintColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.0 alpha:1.0];
-    [self.performanceSwitch addTarget:self
-                               action:@selector(performanceSwitchChanged:)
-                     forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:self.performanceSwitch];
+    UILabel *brandLabel = [self labelWithText:@"GAMEBOOST\n2.0"
+                                         frame:CGRectMake(14.0, 14.0, 100.0, 40.0)
+                                          font:[UIFont systemFontOfSize:13.0 weight:UIFontWeightHeavy]
+                                         color:UIColor.whiteColor];
+    brandLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.sidebar addSubview:brandLabel];
 
-    UILabel *performanceHint = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 79.0, 264.0, 19.0)];
-    performanceHint.text = @"Ưu tiên render; tự tắt khi máy quá nóng";
-    performanceHint.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
-    performanceHint.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
-    [self.panel addSubview:performanceHint];
+    self.gameTabRow = [UIView new];
+    self.gameTabRow.layer.cornerRadius = 11.0;
+    [self.sidebar addSubview:self.gameTabRow];
+    self.gameTabButton = [self sidebarButtonWithTitle:@"Game\nBoost"
+                                             selector:@selector(selectGameTab)];
+    [self.gameTabRow addSubview:self.gameTabButton];
+    self.gameMasterSwitch = [UISwitch new];
+    [self.gameMasterSwitch addTarget:self
+                              action:@selector(gameMasterChanged:)
+                    forControlEvents:UIControlEventValueChanged];
+    [self.gameTabRow addSubview:self.gameMasterSwitch];
 
-    UILabel *landscapeLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 108.0, 190.0, 25.0)];
-    landscapeLabel.text = @"Khóa ngang game";
-    landscapeLabel.textColor = UIColor.whiteColor;
-    landscapeLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
-    [self.panel addSubview:landscapeLabel];
+    self.graphicsTabRow = [UIView new];
+    self.graphicsTabRow.layer.cornerRadius = 11.0;
+    [self.sidebar addSubview:self.graphicsTabRow];
+    self.graphicsTabButton = [self sidebarButtonWithTitle:@"Enhance\nGraphic"
+                                                 selector:@selector(selectGraphicsTab)];
+    [self.graphicsTabRow addSubview:self.graphicsTabButton];
+    self.graphicsMasterSwitch = [UISwitch new];
+    [self.graphicsMasterSwitch addTarget:self
+                                  action:@selector(graphicsMasterChanged:)
+                        forControlEvents:UIControlEventValueChanged];
+    [self.graphicsTabRow addSubview:self.graphicsMasterSwitch];
 
-    self.landscapeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(228.0, 104.0, 51.0, 31.0)];
-    self.landscapeSwitch.onTintColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.0 alpha:1.0];
-    [self.landscapeSwitch addTarget:self
-                             action:@selector(landscapeSwitchChanged:)
-                   forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:self.landscapeSwitch];
+    self.settingsTabRow = [UIView new];
+    self.settingsTabRow.layer.cornerRadius = 11.0;
+    [self.sidebar addSubview:self.settingsTabRow];
+    self.settingsTabButton = [self sidebarButtonWithTitle:@"Settings"
+                                                 selector:@selector(selectSettingsTab)];
+    [self.settingsTabRow addSubview:self.settingsTabButton];
 
-    self.landscapeHintLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 135.0, 264.0, 19.0)];
-    self.landscapeHintLabel.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
-    self.landscapeHintLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
-    [self.panel addSubview:self.landscapeHintLabel];
+    CGRect pageFrame = CGRectMake(130.0, 0.0, 350.0, 350.0);
+    self.gameScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
+    self.graphicsScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
+    self.settingsScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
+    for (UIScrollView *scroll in @[self.gameScroll, self.graphicsScroll, self.settingsScroll]) {
+        scroll.alwaysBounceVertical = YES;
+        scroll.showsVerticalScrollIndicator = YES;
+        scroll.backgroundColor = UIColor.clearColor;
+        [self.panel addSubview:scroll];
+    }
 
-    UILabel *scaleLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 164.0, 180.0, 25.0)];
-    scaleLabel.text = @"Độ phân giải app";
-    scaleLabel.textColor = UIColor.whiteColor;
-    scaleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
-    [self.panel addSubview:scaleLabel];
+    [self buildGamePage];
+    [self buildGraphicsPage];
+    [self buildSettingsPage];
 
-    self.scaleValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(218.0, 164.0, 64.0, 25.0)];
-    self.scaleValueLabel.textColor = [UIColor colorWithRed:0.25 green:0.76 blue:1.0 alpha:1.0];
-    self.scaleValueLabel.textAlignment = NSTextAlignmentRight;
-    self.scaleValueLabel.font = [UIFont monospacedDigitSystemFontOfSize:15.0 weight:UIFontWeightSemibold];
-    [self.panel addSubview:self.scaleValueLabel];
+    self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.closeButton.frame = CGRectMake(432.0, 4.0, 44.0, 44.0);
+    self.closeButton.titleLabel.font = [UIFont systemFontOfSize:24.0 weight:UIFontWeightRegular];
+    self.closeButton.accessibilityLabel = @"Close GameBoost menu";
+    [self.closeButton setTitle:@"×" forState:UIControlStateNormal];
+    [self.closeButton setTitleColor:[UIColor colorWithWhite:0.88 alpha:1.0]
+                           forState:UIControlStateNormal];
+    [self.closeButton addTarget:self action:@selector(hidePanel)
+               forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:self.closeButton];
 
-    self.scaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(18.0, 193.0, 264.0, 30.0)];
-    self.scaleSlider.minimumValue = 0.1f;
-    self.scaleSlider.maximumValue = 1.0f;
-    self.scaleSlider.minimumTrackTintColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.0 alpha:1.0];
-    [self.scaleSlider addTarget:self action:@selector(scaleSliderChanged:)
-               forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:self.scaleSlider];
-
-    self.scaleHintLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 225.0, 264.0, 18.0)];
-    self.scaleHintLabel.textColor = [UIColor colorWithWhite:0.67 alpha:1.0];
-    self.scaleHintLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
-    [self.panel addSubview:self.scaleHintLabel];
-
-    UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    resetButton.frame = CGRectMake(18.0, 252.0, 264.0, 32.0);
-    resetButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
-    resetButton.layer.cornerRadius = 8.0;
-    resetButton.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
-    [resetButton setTitle:@"Đặt lại 100%" forState:UIControlStateNormal];
-    [resetButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [resetButton addTarget:self action:@selector(resetScale) forControlEvents:UIControlEventTouchUpInside];
-    [self.panel addSubview:resetButton];
+    self.panelPanGesture =
+        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragPanel:)];
+    self.panelPanGesture.delegate = self;
+    [self.panel addGestureRecognizer:self.panelPanGesture];
 
     [NSNotificationCenter.defaultCenter addObserver:self
                                            selector:@selector(settingsDidChange)
                                                name:GBSettingsDidChangeNotification
                                              object:nil];
     [self settingsDidChange];
+}
+
+- (void)buildGamePage {
+    const CGFloat width = CGRectGetWidth(self.gameScroll.bounds);
+    [self addPageTitle:@"GameBoost" to:self.gameScroll];
+    self.gameStatusLabel = [self addStatusLabelTo:self.gameScroll y:48.0];
+
+    self.performanceSwitch = [self addSwitchRowTo:self.gameScroll
+                                            title:@"Performance QoS"
+                                             hint:@"Ưu tiên thread render; không còn tự tắt theo nhiệt."
+                                                y:84.0
+                                         selector:@selector(performanceSwitchChanged:)];
+    self.lowLatencySwitch = [self addSwitchRowTo:self.gameScroll
+                                           title:@"Low latency 2-buffer"
+                                            hint:@"Giảm hàng đợi Metal; thử tắt nếu game bị khựng."
+                                               y:154.0
+                                        selector:@selector(lowLatencySwitchChanged:)];
+    self.keepAwakeSwitch = [self addSwitchRowTo:self.gameScroll
+                                          title:@"Giữ màn hình sáng"
+                                           hint:@"Không cho máy tự khóa khi đang chơi."
+                                              y:224.0
+                                       selector:@selector(keepAwakeSwitchChanged:)];
+    self.landscapeSwitch = [self addSwitchRowTo:self.gameScroll
+                                          title:@"Khóa ngang game"
+                                           hint:@""
+                                              y:294.0
+                                       selector:@selector(landscapeSwitchChanged:)];
+    self.landscapeHintLabel = (UILabel *)self.gameScroll.subviews.lastObject;
+
+    UILabel *fpsLabel = [self labelWithText:@"Giới hạn / ưu tiên FPS"
+                                       frame:CGRectMake(16.0, 368.0, width - 32.0, 22.0)
+                                        font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                       color:UIColor.whiteColor];
+    [self.gameScroll addSubview:fpsLabel];
+    self.fpsControl = [[UISegmentedControl alloc] initWithItems:@[@"Auto", @"30", @"60", @"120"]];
+    self.fpsControl.frame = CGRectMake(16.0, 397.0, width - 32.0, 32.0);
+    self.fpsControl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.fpsControl addTarget:self action:@selector(fpsChanged:)
+              forControlEvents:UIControlEventValueChanged];
+    [self.gameScroll addSubview:self.fpsControl];
+    UILabel *fpsHint = [self labelWithText:@"120 chỉ áp dụng khi màn hình và game hỗ trợ."
+                                      frame:CGRectMake(16.0, 434.0, width - 32.0, 20.0)
+                                       font:[UIFont systemFontOfSize:11.0]
+                                      color:[UIColor colorWithWhite:0.69 alpha:1.0]];
+    [self.gameScroll addSubview:fpsHint];
+
+    UILabel *scaleLabel = [self labelWithText:@"Độ phân giải app"
+                                         frame:CGRectMake(16.0, 466.0, width - 100.0, 24.0)
+                                          font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                         color:UIColor.whiteColor];
+    [self.gameScroll addSubview:scaleLabel];
+    self.scaleValueLabel = [self labelWithText:@"100%"
+                                         frame:CGRectMake(width - 82.0, 466.0, 66.0, 24.0)
+                                          font:[UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightSemibold]
+                                         color:UIColor.whiteColor];
+    self.scaleValueLabel.textAlignment = NSTextAlignmentRight;
+    self.scaleValueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [self.gameScroll addSubview:self.scaleValueLabel];
+    self.scaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(16.0, 495.0, width - 32.0, 30.0)];
+    self.scaleSlider.minimumValue = 0.1f;
+    self.scaleSlider.maximumValue = 1.0f;
+    self.scaleSlider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.scaleSlider addTarget:self action:@selector(scaleSliderChanged:)
+               forControlEvents:UIControlEventValueChanged];
+    [self.gameScroll addSubview:self.scaleSlider];
+    self.scaleHintLabel = [self labelWithText:@""
+                                        frame:CGRectMake(16.0, 528.0, width - 32.0, 34.0)
+                                         font:[UIFont systemFontOfSize:11.0]
+                                        color:[UIColor colorWithWhite:0.69 alpha:1.0]];
+    [self.gameScroll addSubview:self.scaleHintLabel];
+    UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    resetButton.frame = CGRectMake(16.0, 570.0, width - 32.0, 34.0);
+    resetButton.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    resetButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
+    resetButton.layer.cornerRadius = 9.0;
+    [resetButton setTitle:@"Đặt lại độ phân giải 100%" forState:UIControlStateNormal];
+    [resetButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [resetButton addTarget:self action:@selector(resetGameScale)
+          forControlEvents:UIControlEventTouchUpInside];
+    [self.gameScroll addSubview:resetButton];
+    self.gameScroll.contentSize = CGSizeMake(width, 622.0);
+}
+
+- (void)buildGraphicsPage {
+    const CGFloat width = CGRectGetWidth(self.graphicsScroll.bounds);
+    [self addPageTitle:@"Enhance Graphic" to:self.graphicsScroll];
+    self.graphicsStatusLabel = [self addStatusLabelTo:self.graphicsScroll y:48.0];
+
+    UILabel *scaleLabel = [self labelWithText:@"Super Resolution"
+                                         frame:CGRectMake(16.0, 86.0, width - 100.0, 24.0)
+                                          font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                         color:UIColor.whiteColor];
+    [self.graphicsScroll addSubview:scaleLabel];
+    self.graphicsScaleValueLabel = [self labelWithText:@"100%"
+                                                 frame:CGRectMake(width - 82.0, 86.0, 66.0, 24.0)
+                                                  font:[UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightSemibold]
+                                                 color:UIColor.whiteColor];
+    self.graphicsScaleValueLabel.textAlignment = NSTextAlignmentRight;
+    self.graphicsScaleValueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [self.graphicsScroll addSubview:self.graphicsScaleValueLabel];
+    self.graphicsScaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(16.0, 115.0, width - 32.0, 30.0)];
+    self.graphicsScaleSlider.minimumValue = 1.0f;
+    self.graphicsScaleSlider.maximumValue = 1.5f;
+    self.graphicsScaleSlider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.graphicsScaleSlider addTarget:self action:@selector(graphicsScaleChanged:)
+                       forControlEvents:UIControlEventValueChanged];
+    [self.graphicsScroll addSubview:self.graphicsScaleSlider];
+    self.graphicsScaleHintLabel = [self labelWithText:@""
+                                                frame:CGRectMake(16.0, 148.0, width - 32.0, 38.0)
+                                                 font:[UIFont systemFontOfSize:11.0]
+                                                color:[UIColor colorWithWhite:0.69 alpha:1.0]];
+    [self.graphicsScroll addSubview:self.graphicsScaleHintLabel];
+
+    self.linearFilteringSwitch = [self addSwitchRowTo:self.graphicsScroll
+                                                title:@"Linear texture filter"
+                                                 hint:@"Làm mượt phóng/thu texture trên Metal."
+                                                    y:196.0
+                                             selector:@selector(linearFilteringChanged:)];
+    self.trilinearFilteringSwitch = [self addSwitchRowTo:self.graphicsScroll
+                                                   title:@"Trilinear mip filter"
+                                                    hint:@"Chuyển mipmap mượt hơn ở vật thể xa."
+                                                       y:266.0
+                                                selector:@selector(trilinearFilteringChanged:)];
+
+    UILabel *anisoLabel = [self labelWithText:@"Anisotropic filtering"
+                                         frame:CGRectMake(16.0, 340.0, width - 100.0, 24.0)
+                                          font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                         color:UIColor.whiteColor];
+    [self.graphicsScroll addSubview:anisoLabel];
+    self.anisotropyValueLabel = [self labelWithText:@"4×"
+                                              frame:CGRectMake(width - 82.0, 340.0, 66.0, 24.0)
+                                               font:[UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightSemibold]
+                                              color:UIColor.whiteColor];
+    self.anisotropyValueLabel.textAlignment = NSTextAlignmentRight;
+    self.anisotropyValueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [self.graphicsScroll addSubview:self.anisotropyValueLabel];
+    self.anisotropySlider = [[UISlider alloc] initWithFrame:CGRectMake(16.0, 369.0, width - 32.0, 30.0)];
+    self.anisotropySlider.minimumValue = 0.0f;
+    self.anisotropySlider.maximumValue = 4.0f;
+    self.anisotropySlider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.anisotropySlider addTarget:self action:@selector(anisotropyChanged:)
+                     forControlEvents:UIControlEventValueChanged];
+    [self.graphicsScroll addSubview:self.anisotropySlider];
+    UILabel *anisoHint = [self labelWithText:@"1× / 2× / 4× / 8× / 16× • pipeline tạo mới"
+                                        frame:CGRectMake(16.0, 401.0, width - 32.0, 24.0)
+                                         font:[UIFont systemFontOfSize:11.0]
+                                        color:[UIColor colorWithWhite:0.69 alpha:1.0]];
+    [self.graphicsScroll addSubview:anisoHint];
+
+    self.wideColorSwitch = [self addSwitchRowTo:self.graphicsScroll
+                                          title:@"Display-P3 output"
+                                           hint:@"Dải màu rộng cho CAMetalLayer khi màn hình hỗ trợ."
+                                              y:438.0
+                                       selector:@selector(wideColorChanged:)];
+    self.highQualityScalingSwitch = [self addSwitchRowTo:self.graphicsScroll
+                                                   title:@"High-quality layer scaling"
+                                                    hint:@"Dùng lọc trilinear khi Metal layer được scale."
+                                                       y:508.0
+                                                selector:@selector(highQualityScalingChanged:)];
+    UILabel *compatibility = [self labelWithText:@"Lưu ý: hiệu quả tùy engine. Tweak không ép shader, texture pack hay MSAA vì có thể làm game crash."
+                                             frame:CGRectMake(16.0, 580.0, width - 32.0, 52.0)
+                                              font:[UIFont systemFontOfSize:11.0 weight:UIFontWeightMedium]
+                                             color:[UIColor colorWithRed:1.0 green:0.76 blue:0.36 alpha:1.0]];
+    [self.graphicsScroll addSubview:compatibility];
+    self.graphicsScroll.contentSize = CGSizeMake(width, 644.0);
+}
+
+- (void)buildSettingsPage {
+    const CGFloat width = CGRectGetWidth(self.settingsScroll.bounds);
+    [self addPageTitle:@"Settings" to:self.settingsScroll];
+
+    UILabel *sizeLabel = [self labelWithText:@"Kích thước menu"
+                                        frame:CGRectMake(16.0, 62.0, width - 100.0, 24.0)
+                                         font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                        color:UIColor.whiteColor];
+    [self.settingsScroll addSubview:sizeLabel];
+    self.menuScaleValueLabel = [self labelWithText:@"100%"
+                                             frame:CGRectMake(width - 82.0, 62.0, 66.0, 24.0)
+                                              font:[UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightSemibold]
+                                             color:UIColor.whiteColor];
+    self.menuScaleValueLabel.textAlignment = NSTextAlignmentRight;
+    self.menuScaleValueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [self.settingsScroll addSubview:self.menuScaleValueLabel];
+    self.menuScaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(16.0, 91.0, width - 32.0, 30.0)];
+    self.menuScaleSlider.minimumValue = 0.75f;
+    self.menuScaleSlider.maximumValue = 1.25f;
+    self.menuScaleSlider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.menuScaleSlider addTarget:self action:@selector(menuScaleChanged:)
+                    forControlEvents:UIControlEventValueChanged];
+    [self.settingsScroll addSubview:self.menuScaleSlider];
+
+    self.menuDragSwitch = [self addSwitchRowTo:self.settingsScroll
+                                         title:@"Cho phép kéo menu"
+                                          hint:@"Tắt để panel luôn cố định giữa màn hình."
+                                             y:142.0
+                                      selector:@selector(menuDragChanged:)];
+
+    UILabel *hueLabel = [self labelWithText:@"Màu chủ đề"
+                                       frame:CGRectMake(16.0, 218.0, width - 32.0, 24.0)
+                                        font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                       color:UIColor.whiteColor];
+    [self.settingsScroll addSubview:hueLabel];
+    self.hueSlider = [[UISlider alloc] initWithFrame:CGRectMake(16.0, 247.0, width - 32.0, 30.0)];
+    self.hueSlider.minimumValue = 0.0f;
+    self.hueSlider.maximumValue = 1.0f;
+    self.hueSlider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.hueSlider addTarget:self action:@selector(hueChanged:)
+              forControlEvents:UIControlEventValueChanged];
+    [self.settingsScroll addSubview:self.hueSlider];
+
+    UILabel *opacityLabel = [self labelWithText:@"Độ trong suốt"
+                                           frame:CGRectMake(16.0, 298.0, width - 100.0, 24.0)
+                                            font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
+                                           color:UIColor.whiteColor];
+    [self.settingsScroll addSubview:opacityLabel];
+    self.opacityValueLabel = [self labelWithText:@"96%"
+                                           frame:CGRectMake(width - 82.0, 298.0, 66.0, 24.0)
+                                            font:[UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightSemibold]
+                                           color:UIColor.whiteColor];
+    self.opacityValueLabel.textAlignment = NSTextAlignmentRight;
+    self.opacityValueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [self.settingsScroll addSubview:self.opacityValueLabel];
+    self.opacitySlider = [[UISlider alloc] initWithFrame:CGRectMake(16.0, 327.0, width - 32.0, 30.0)];
+    self.opacitySlider.minimumValue = 0.45f;
+    self.opacitySlider.maximumValue = 1.0f;
+    self.opacitySlider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.opacitySlider addTarget:self action:@selector(opacityChanged:)
+                  forControlEvents:UIControlEventValueChanged];
+    [self.settingsScroll addSubview:self.opacitySlider];
+
+    self.liquidGlassSwitch = [self addSwitchRowTo:self.settingsScroll
+                                            title:@"Liquid Glass"
+                                             hint:@"Blur + gradient kính, tương thích iOS 12–18."
+                                                y:380.0
+                                         selector:@selector(liquidGlassChanged:)];
+    UILabel *settingsHint = [self labelWithText:@"Settings luôn hoạt động, kể cả khi hai module đang tắt."
+                                            frame:CGRectMake(16.0, 456.0, width - 32.0, 36.0)
+                                             font:[UIFont systemFontOfSize:11.0 weight:UIFontWeightMedium]
+                                            color:[UIColor colorWithWhite:0.69 alpha:1.0]];
+    [self.settingsScroll addSubview:settingsHint];
+    self.settingsScroll.contentSize = CGSizeMake(width, 510.0);
 }
 
 - (void)dealloc {
@@ -699,10 +1477,8 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
     if (GBShouldKeepLandscape()) {
         return GBPreferredLandscapeOrientation();
     }
-
     UIWindow *hostWindow = GBHostApplicationWindow();
-    UIViewController *hostController =
-        GBTopViewController(hostWindow.rootViewController);
+    UIViewController *hostController = GBTopViewController(hostWindow.rootViewController);
     UIInterfaceOrientation preferred =
         hostController.preferredInterfaceOrientationForPresentation;
     const UIInterfaceOrientationMask mask = GBHostOrientationMask();
@@ -718,77 +1494,76 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     if (!self.hasInitialButtonPosition) {
-        self.menuButton.center = CGPointMake(42.0, MAX(110.0, self.view.safeAreaInsets.top + 42.0));
+        self.menuButton.center = CGPointMake(41.0,
+            MAX(108.0, self.view.safeAreaInsets.top + 38.0));
         self.hasInitialButtonPosition = YES;
     }
     [self clampMenuButton];
-    [self layoutPanelNearButton];
+    [self layoutPanel];
 }
 
-- (void)settingsDidChange {
-    self.performanceSwitch.on = gPerformanceEnabled.load(std::memory_order_relaxed);
-    self.landscapeSwitch.on =
-        gLandscapeLockEnabled.load(std::memory_order_relaxed);
-    self.landscapeHintLabel.text = GBAppIsLandscapeOnly()
-        ? @"Game chỉ hỗ trợ ngang • GameBoost tự giữ đúng hướng"
-        : @"Vẫn nằm ngang khi bật khóa xoay của hệ thống";
-    const double activeScale = gResolutionScale.load(std::memory_order_relaxed);
-    const double configuredScale =
-        gConfiguredResolutionScale.load(std::memory_order_relaxed);
-    const BOOL needsRelaunch = fabs(activeScale - configuredScale) >= 0.001;
+- (void)layoutPanel {
+    CGRect safeBounds = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
+    const CGFloat margin = 8.0;
+    const CGFloat scale = (CGFloat)gMenuScale.load(std::memory_order_relaxed);
+    const CGFloat maxWidth = MAX(1.0, CGRectGetWidth(safeBounds) - margin * 2.0);
+    const CGFloat maxHeight = MAX(1.0, CGRectGetHeight(safeBounds) - margin * 2.0);
+    const CGFloat width = MIN(maxWidth, MAX(MIN(340.0, maxWidth), 480.0 * scale));
+    const CGFloat height = MIN(maxHeight, MAX(MIN(270.0, maxHeight), 350.0 * scale));
 
-    self.scaleSlider.value = (float)configuredScale;
-    if (needsRelaunch) {
-        self.scaleValueLabel.text =
-            [NSString stringWithFormat:@"%.0f%%↻", configuredScale * 100.0];
-    } else {
-        self.scaleValueLabel.text =
-            [NSString stringWithFormat:@"%.0f%%", configuredScale * 100.0];
+    CGPoint center = self.panel.center;
+    if (!self.hasPanelPosition || !gMenuDragEnabled.load(std::memory_order_relaxed)) {
+        center = CGPointMake(CGRectGetMidX(safeBounds), CGRectGetMidY(safeBounds));
+        self.hasPanelPosition = YES;
     }
-    if (needsRelaunch) {
-        self.scaleHintLabel.text = @"Đã lưu • đóng/mở lại app để áp dụng an toàn";
-    } else if (configuredScale <= 0.25) {
-        self.scaleHintLabel.text = @"10–25% rất mờ • menu vẫn giữ độ nét gốc";
-    } else {
-        self.scaleHintLabel.text = @"Giảm pixel thật • giữ nguyên khung hình, không zoom";
+    self.panel.bounds = CGRectMake(0.0, 0.0, width, height);
+    self.panel.center = center;
+    [self clampPanel];
+
+    self.glassView.frame = self.panel.bounds;
+    self.shineView.frame = self.panel.bounds;
+    self.shineGradient.frame = self.shineView.bounds;
+    const CGFloat sidebarWidth = MIN(145.0, MAX(124.0, width * 0.30));
+    self.sidebar.frame = CGRectMake(0.0, 0.0, sidebarWidth, height);
+
+    self.gameTabRow.frame = CGRectMake(8.0, 64.0, sidebarWidth - 16.0, 72.0);
+    self.graphicsTabRow.frame = CGRectMake(8.0, 144.0, sidebarWidth - 16.0, 72.0);
+    self.settingsTabRow.frame = CGRectMake(8.0,
+                                           MIN(224.0, height - 58.0),
+                                           sidebarWidth - 16.0,
+                                           50.0);
+    CGFloat rowWidth = CGRectGetWidth(self.gameTabRow.bounds);
+    self.gameTabButton.frame = CGRectMake(8.0, 0.0, MAX(40.0, rowWidth - 58.0), 72.0);
+    self.gameMasterSwitch.frame = CGRectMake(MAX(0.0, rowWidth - 52.0), 20.0, 51.0, 31.0);
+    rowWidth = CGRectGetWidth(self.graphicsTabRow.bounds);
+    self.graphicsTabButton.frame = CGRectMake(8.0, 0.0, MAX(40.0, rowWidth - 58.0), 72.0);
+    self.graphicsMasterSwitch.frame = CGRectMake(MAX(0.0, rowWidth - 52.0), 20.0, 51.0, 31.0);
+    self.settingsTabButton.frame = CGRectMake(8.0, 0.0,
+                                              CGRectGetWidth(self.settingsTabRow.bounds) - 16.0,
+                                              50.0);
+
+    CGRect pageFrame = CGRectMake(sidebarWidth, 0.0, width - sidebarWidth, height);
+    for (UIScrollView *scroll in @[self.gameScroll, self.graphicsScroll, self.settingsScroll]) {
+        scroll.frame = pageFrame;
+        scroll.contentSize = CGSizeMake(CGRectGetWidth(pageFrame), scroll.contentSize.height);
+        scroll.scrollIndicatorInsets = UIEdgeInsetsMake(45.0, 0.0, 8.0, 2.0);
     }
+    self.closeButton.frame = CGRectMake(width - 46.0, 2.0, 44.0, 44.0);
 }
 
-- (void)togglePanel {
-    self.panel.hidden = !self.panel.hidden;
-    if (!self.panel.hidden) {
-        [self layoutPanelNearButton];
-    }
-}
-
-- (void)hidePanel {
-    self.panel.hidden = YES;
-}
-
-- (void)performanceSwitchChanged:(UISwitch *)sender {
-    GBSetPerformanceEnabled(sender.isOn, YES);
-}
-
-- (void)landscapeSwitchChanged:(UISwitch *)sender {
-    GBSetLandscapeLockEnabled(sender.isOn, YES);
-}
-
-- (void)scaleSliderChanged:(UISlider *)sender {
-    const double quantized = round((double)sender.value * 20.0) / 20.0;
-    GBSetResolutionScale(quantized, YES);
-}
-
-- (void)resetScale {
-    GBSetResolutionScale(1.0, YES);
-}
-
-- (void)dragMenuButton:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self.view];
-    self.menuButton.center = CGPointMake(self.menuButton.center.x + translation.x,
-                                         self.menuButton.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self.view];
-    [self clampMenuButton];
-    [self layoutPanelNearButton];
+- (void)clampPanel {
+    CGRect safeBounds = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
+    const CGFloat margin = 8.0;
+    CGFloat halfWidth = CGRectGetWidth(self.panel.bounds) / 2.0;
+    CGFloat halfHeight = CGRectGetHeight(self.panel.bounds) / 2.0;
+    CGFloat minX = CGRectGetMinX(safeBounds) + halfWidth + margin;
+    CGFloat maxX = CGRectGetMaxX(safeBounds) - halfWidth - margin;
+    CGFloat minY = CGRectGetMinY(safeBounds) + halfHeight + margin;
+    CGFloat maxY = CGRectGetMaxY(safeBounds) - halfHeight - margin;
+    self.panel.center = CGPointMake(minX > maxX ? CGRectGetMidX(safeBounds)
+                                                : MIN(MAX(self.panel.center.x, minX), maxX),
+                                    minY > maxY ? CGRectGetMidY(safeBounds)
+                                                : MIN(MAX(self.panel.center.y, minY), maxY));
 }
 
 - (void)clampMenuButton {
@@ -803,23 +1578,321 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
                                          MIN(MAX(self.menuButton.center.y, minY), maxY));
 }
 
-- (void)layoutPanelNearButton {
-    CGRect safeBounds = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
-    const CGFloat margin = 12.0;
-    const CGFloat panelWidth = MIN(300.0, MAX(260.0, CGRectGetWidth(safeBounds) - margin * 2.0));
-    const CGFloat panelHeight = 294.0;
-    CGFloat x = CGRectGetMaxX(self.menuButton.frame) + 10.0;
-    if (x + panelWidth > CGRectGetMaxX(safeBounds) - margin) {
-        x = CGRectGetMinX(self.menuButton.frame) - panelWidth - 10.0;
+- (void)applyTintToView:(UIView *)view color:(UIColor *)color {
+    if ([view isKindOfClass:UISwitch.class]) {
+        ((UISwitch *)view).onTintColor = color;
+    } else if ([view isKindOfClass:UISlider.class]) {
+        ((UISlider *)view).minimumTrackTintColor = color;
+    } else if ([view isKindOfClass:UISegmentedControl.class]) {
+        UISegmentedControl *control = (UISegmentedControl *)view;
+        if (@available(iOS 13.0, *)) {
+            control.selectedSegmentTintColor = color;
+        } else {
+            control.tintColor = color;
+        }
     }
-    x = MIN(MAX(x, CGRectGetMinX(safeBounds) + margin), CGRectGetMaxX(safeBounds) - panelWidth - margin);
+    for (UIView *subview in view.subviews) {
+        [self applyTintToView:subview color:color];
+    }
+}
 
-    CGFloat y = CGRectGetMinY(self.menuButton.frame);
-    if (y + panelHeight > CGRectGetMaxY(safeBounds) - margin) {
-        y = CGRectGetMaxY(safeBounds) - panelHeight - margin;
+- (void)applyVisualSettings {
+    UIColor *theme = GBThemeColor();
+    self.menuButton.layer.borderColor = [theme colorWithAlphaComponent:0.95].CGColor;
+    self.panel.layer.borderColor = [theme colorWithAlphaComponent:0.42].CGColor;
+    self.panel.alpha = (CGFloat)gMenuOpacity.load(std::memory_order_relaxed);
+    self.sidebar.backgroundColor = [theme colorWithAlphaComponent:0.10];
+    [self applyTintToView:self.panel color:theme];
+
+    self.gameTabRow.backgroundColor = self.selectedTab == 0
+        ? [theme colorWithAlphaComponent:0.24]
+        : UIColor.clearColor;
+    self.graphicsTabRow.backgroundColor = self.selectedTab == 1
+        ? [theme colorWithAlphaComponent:0.24]
+        : UIColor.clearColor;
+    self.settingsTabRow.backgroundColor = self.selectedTab == 2
+        ? [theme colorWithAlphaComponent:0.24]
+        : UIColor.clearColor;
+    self.gameStatusLabel.backgroundColor = GBIsGameBoostActive()
+        ? [theme colorWithAlphaComponent:0.25]
+        : [UIColor colorWithWhite:1.0 alpha:0.08];
+    self.graphicsStatusLabel.backgroundColor = GBIsEnhanceGraphicsActive()
+        ? [theme colorWithAlphaComponent:0.25]
+        : [UIColor colorWithWhite:1.0 alpha:0.08];
+    self.scaleValueLabel.textColor = theme;
+    self.graphicsScaleValueLabel.textColor = theme;
+    self.anisotropyValueLabel.textColor = theme;
+    self.menuScaleValueLabel.textColor = theme;
+    self.opacityValueLabel.textColor = theme;
+
+    const BOOL glass = gLiquidGlassEnabled.load(std::memory_order_relaxed);
+    self.glassView.hidden = !glass;
+    self.shineView.hidden = !glass;
+    self.panel.backgroundColor = glass
+        ? [UIColor colorWithWhite:0.04 alpha:0.38]
+        : [UIColor colorWithWhite:0.045 alpha:0.96];
+    self.shineGradient.colors = @[
+        (id)[UIColor colorWithWhite:1.0 alpha:0.20].CGColor,
+        (id)[theme colorWithAlphaComponent:0.09].CGColor,
+        (id)[UIColor colorWithWhite:0.0 alpha:0.12].CGColor
+    ];
+    self.shineGradient.locations = @[@0.0, @0.44, @1.0];
+}
+
+- (void)settingsDidChange {
+    const GBModuleMode mode = GBCurrentModuleMode();
+    self.gameMasterSwitch.on = mode == GBModuleModeGameBoost;
+    self.graphicsMasterSwitch.on = mode == GBModuleModeEnhanceGraphics;
+    self.gameScroll.userInteractionEnabled = mode == GBModuleModeGameBoost;
+    self.graphicsScroll.userInteractionEnabled = mode == GBModuleModeEnhanceGraphics;
+    self.gameScroll.alpha = mode == GBModuleModeGameBoost ? 1.0 : 0.34;
+    self.graphicsScroll.alpha = mode == GBModuleModeEnhanceGraphics ? 1.0 : 0.34;
+    self.gameStatusLabel.text = mode == GBModuleModeGameBoost
+        ? @"● MODULE ĐANG BẬT"
+        : @"MODULE ĐÃ KHÓA • BẬT Ở BÊN TRÁI";
+    self.graphicsStatusLabel.text = mode == GBModuleModeEnhanceGraphics
+        ? @"● MODULE ĐANG BẬT"
+        : @"MODULE ĐÃ KHÓA • BẬT Ở BÊN TRÁI";
+
+    self.performanceSwitch.on = gPerformanceEnabled.load(std::memory_order_relaxed);
+    self.lowLatencySwitch.on = gLowLatencyEnabled.load(std::memory_order_relaxed);
+    self.keepAwakeSwitch.on = gKeepAwakeEnabled.load(std::memory_order_relaxed);
+    self.landscapeSwitch.on = gLandscapeLockEnabled.load(std::memory_order_relaxed);
+    self.landscapeHintLabel.text = GBAppIsLandscapeOnly()
+        ? @"Game chỉ hỗ trợ ngang • tự giữ đúng hướng."
+        : @"Vẫn nằm ngang khi khóa xoay hệ thống đang bật.";
+    NSInteger frameRate = gFrameRate.load(std::memory_order_relaxed);
+    self.fpsControl.selectedSegmentIndex = frameRate == 30 ? 1
+        : frameRate == 60 ? 2
+        : frameRate == 120 ? 3
+        : 0;
+
+    const double gameScale = gConfiguredResolutionScale.load(std::memory_order_relaxed);
+    self.scaleSlider.value = (float)gameScale;
+    const BOOL gameNeedsRelaunch = mode == GBModuleModeGameBoost &&
+        (gLaunchedModuleMode != GBModuleModeGameBoost ||
+         fabs(gResolutionScale.load(std::memory_order_relaxed) - gameScale) >= 0.001);
+    self.scaleValueLabel.text = [NSString stringWithFormat:@"%.0f%%%@",
+        gameScale * 100.0, gameNeedsRelaunch ? @"↻" : @""];
+    if (gameNeedsRelaunch) {
+        self.scaleHintLabel.text = @"Đã lưu • đóng/mở lại app để áp dụng an toàn.";
+    } else if (gameScale <= 0.25) {
+        self.scaleHintLabel.text = @"10–25% rất mờ • menu vẫn giữ độ nét gốc.";
+    } else {
+        self.scaleHintLabel.text = @"Giảm pixel thật, giữ nguyên khung hình • không zoom.";
     }
-    y = MAX(y, CGRectGetMinY(safeBounds) + margin);
-    self.panel.frame = CGRectMake(x, y, panelWidth, panelHeight);
+
+    const double graphicsScale = gConfiguredGraphicsScale.load(std::memory_order_relaxed);
+    self.graphicsScaleSlider.value = (float)graphicsScale;
+    const BOOL graphicsNeedsRelaunch = mode == GBModuleModeEnhanceGraphics &&
+        (gLaunchedModuleMode != GBModuleModeEnhanceGraphics ||
+         fabs(gResolutionScale.load(std::memory_order_relaxed) - graphicsScale) >= 0.001);
+    self.graphicsScaleValueLabel.text = [NSString stringWithFormat:@"%.0f%%%@",
+        graphicsScale * 100.0, graphicsNeedsRelaunch ? @"↻" : @""];
+    self.graphicsScaleHintLabel.text = graphicsNeedsRelaunch
+        ? @"Đã lưu • đóng/mở lại app để đổi framebuffer."
+        : @"Render 100–150% rồi downsample; tốn GPU và RAM hơn.";
+    self.linearFilteringSwitch.on = gLinearFilteringEnabled.load(std::memory_order_relaxed);
+    self.trilinearFilteringSwitch.on = gTrilinearFilteringEnabled.load(std::memory_order_relaxed);
+    const int anisotropy = gAnisotropyLevel.load(std::memory_order_relaxed);
+    self.anisotropySlider.value = anisotropy == 16 ? 4.0f
+        : anisotropy == 8 ? 3.0f
+        : anisotropy == 4 ? 2.0f
+        : anisotropy == 2 ? 1.0f
+        : 0.0f;
+    self.anisotropyValueLabel.text = [NSString stringWithFormat:@"%d×", anisotropy];
+    self.wideColorSwitch.on = gWideColorEnabled.load(std::memory_order_relaxed);
+    self.highQualityScalingSwitch.on =
+        gHighQualityScalingEnabled.load(std::memory_order_relaxed);
+
+    self.menuScaleSlider.value = (float)gMenuScale.load(std::memory_order_relaxed);
+    self.menuScaleValueLabel.text = [NSString stringWithFormat:@"%.0f%%",
+        gMenuScale.load(std::memory_order_relaxed) * 100.0];
+    self.menuDragSwitch.on = gMenuDragEnabled.load(std::memory_order_relaxed);
+    self.panelPanGesture.enabled = self.menuDragSwitch.isOn;
+    self.hueSlider.value = (float)gMenuHue.load(std::memory_order_relaxed);
+    self.opacitySlider.value = (float)gMenuOpacity.load(std::memory_order_relaxed);
+    self.opacityValueLabel.text = [NSString stringWithFormat:@"%.0f%%",
+        gMenuOpacity.load(std::memory_order_relaxed) * 100.0];
+    self.liquidGlassSwitch.on = gLiquidGlassEnabled.load(std::memory_order_relaxed);
+
+    self.gameScroll.hidden = self.selectedTab != 0;
+    self.graphicsScroll.hidden = self.selectedTab != 1;
+    self.settingsScroll.hidden = self.selectedTab != 2;
+    [self.panel bringSubviewToFront:self.closeButton];
+    [self applyVisualSettings];
+    [self.view setNeedsLayout];
+}
+
+- (void)selectGameTab {
+    self.selectedTab = 0;
+    [self settingsDidChange];
+}
+
+- (void)selectGraphicsTab {
+    self.selectedTab = 1;
+    [self settingsDidChange];
+}
+
+- (void)selectSettingsTab {
+    self.selectedTab = 2;
+    [self settingsDidChange];
+}
+
+- (void)gameMasterChanged:(UISwitch *)sender {
+    GBSetModuleMode(sender.isOn ? GBModuleModeGameBoost : GBModuleModeNone, YES);
+}
+
+- (void)graphicsMasterChanged:(UISwitch *)sender {
+    GBSetModuleMode(sender.isOn ? GBModuleModeEnhanceGraphics : GBModuleModeNone, YES);
+}
+
+- (void)performanceSwitchChanged:(UISwitch *)sender {
+    GBSetPerformanceEnabled(sender.isOn, YES);
+}
+
+- (void)lowLatencySwitchChanged:(UISwitch *)sender {
+    GBSetLowLatencyEnabled(sender.isOn, YES);
+}
+
+- (void)keepAwakeSwitchChanged:(UISwitch *)sender {
+    GBSetKeepAwakeEnabled(sender.isOn, YES);
+}
+
+- (void)landscapeSwitchChanged:(UISwitch *)sender {
+    GBSetLandscapeLockEnabled(sender.isOn, YES);
+}
+
+- (void)fpsChanged:(UISegmentedControl *)sender {
+    NSInteger values[] = {0, 30, 60, 120};
+    NSInteger index = MIN(MAX(sender.selectedSegmentIndex, 0), 3);
+    GBSetFrameRate(values[index], YES);
+}
+
+- (void)scaleSliderChanged:(UISlider *)sender {
+    GBSetGameResolutionScale(round((double)sender.value * 20.0) / 20.0, YES);
+}
+
+- (void)resetGameScale {
+    GBSetGameResolutionScale(1.0, YES);
+}
+
+- (void)graphicsScaleChanged:(UISlider *)sender {
+    GBSetGraphicsResolutionScale(round((double)sender.value * 20.0) / 20.0, YES);
+}
+
+- (void)linearFilteringChanged:(UISwitch *)sender {
+    GBSetGraphicsBoolean(gLinearFilteringEnabled, GBLinearFilteringKey, sender.isOn, NO);
+}
+
+- (void)trilinearFilteringChanged:(UISwitch *)sender {
+    GBSetGraphicsBoolean(gTrilinearFilteringEnabled, GBTrilinearFilteringKey, sender.isOn, NO);
+}
+
+- (void)anisotropyChanged:(UISlider *)sender {
+    const NSInteger index = (NSInteger)round(sender.value);
+    const NSInteger values[] = {1, 2, 4, 8, 16};
+    GBSetAnisotropy(values[MIN(MAX(index, 0), 4)]);
+}
+
+- (void)wideColorChanged:(UISwitch *)sender {
+    GBSetGraphicsBoolean(gWideColorEnabled, GBWideColorKey, sender.isOn, YES);
+}
+
+- (void)highQualityScalingChanged:(UISwitch *)sender {
+    GBSetGraphicsBoolean(gHighQualityScalingEnabled,
+                         GBHighQualityScalingKey,
+                         sender.isOn,
+                         YES);
+}
+
+- (void)menuScaleChanged:(UISlider *)sender {
+    const double value = GBClampMenuScale(round((double)sender.value * 20.0) / 20.0);
+    gMenuScale.store(value, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setDouble:value forKey:GBMenuScaleKey];
+    GBPostSettingsChanged();
+}
+
+- (void)menuDragChanged:(UISwitch *)sender {
+    gMenuDragEnabled.store(sender.isOn, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:GBMenuDragKey];
+    if (!sender.isOn) {
+        self.hasPanelPosition = NO;
+    }
+    GBPostSettingsChanged();
+}
+
+- (void)hueChanged:(UISlider *)sender {
+    const double value = GBClampUnit(sender.value, 0.55);
+    gMenuHue.store(value, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setDouble:value forKey:GBMenuHueKey];
+    GBPostSettingsChanged();
+}
+
+- (void)opacityChanged:(UISlider *)sender {
+    const double value = fmin(1.0, fmax(0.45, (double)sender.value));
+    gMenuOpacity.store(value, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setDouble:value forKey:GBMenuOpacityKey];
+    GBPostSettingsChanged();
+}
+
+- (void)liquidGlassChanged:(UISwitch *)sender {
+    gLiquidGlassEnabled.store(sender.isOn, std::memory_order_relaxed);
+    [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:GBLiquidGlassKey];
+    GBPostSettingsChanged();
+}
+
+- (void)togglePanel {
+    self.panel.hidden = !self.panel.hidden;
+    if (!self.panel.hidden) {
+        [self.view setNeedsLayout];
+        [self.view layoutIfNeeded];
+    }
+}
+
+- (void)hidePanel {
+    self.panel.hidden = YES;
+}
+
+- (void)dragMenuButton:(UIPanGestureRecognizer *)gesture {
+    if (!gMenuDragEnabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    CGPoint translation = [gesture translationInView:self.view];
+    self.menuButton.center = CGPointMake(self.menuButton.center.x + translation.x,
+                                         self.menuButton.center.y + translation.y);
+    [gesture setTranslation:CGPointZero inView:self.view];
+    [self clampMenuButton];
+}
+
+- (void)dragPanel:(UIPanGestureRecognizer *)gesture {
+    if (!gMenuDragEnabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    CGPoint translation = [gesture translationInView:self.view];
+    self.panel.center = CGPointMake(self.panel.center.x + translation.x,
+                                    self.panel.center.y + translation.y);
+    [gesture setTranslation:CGPointZero inView:self.view];
+    self.hasPanelPosition = YES;
+    [self clampPanel];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+       shouldReceiveTouch:(UITouch *)touch {
+    if (!gMenuDragEnabled.load(std::memory_order_relaxed)) {
+        return NO;
+    }
+    if (gestureRecognizer == self.panelPanGesture) {
+        UIView *view = touch.view;
+        while (view != nil && view != self.panel) {
+            if ([view isKindOfClass:UIControl.class] ||
+                [view isKindOfClass:UIScrollView.class]) {
+                return NO;
+            }
+            view = view.superview;
+        }
+    }
+    return YES;
 }
 
 @end
@@ -890,6 +1963,15 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
 
 %hook UIApplication
+
+- (void)setIdleTimerDisabled:(BOOL)idleTimerDisabled {
+    if (gIdleTimerOverrideActive && !gApplyingIdleTimerOverride) {
+        gOriginalIdleTimerDisabled = idleTimerDisabled;
+        %orig(YES);
+        return;
+    }
+    %orig(idleTimerDisabled);
+}
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientationsForWindow:(UIWindow *)window {
     UIInterfaceOrientationMask originalMask = %orig(window);
@@ -965,6 +2047,18 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 
 %hook MTKView
 
+- (void)setPreferredFramesPerSecond:(NSInteger)preferredFramesPerSecond {
+    if (!gApplyingMTKViewFPS) {
+        objc_setAssociatedObject(self,
+                                 GBOriginalMTKViewFPSKey,
+                                 @(preferredFramesPerSecond),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    %orig(gApplyingMTKViewFPS
+        ? preferredFramesPerSecond
+        : GBEffectiveFrameRate(preferredFramesPerSecond));
+}
+
 - (void)setDrawableSize:(CGSize)drawableSize {
     CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
     objc_setAssociatedObject(metalLayer,
@@ -977,13 +2071,36 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         return;
     }
 
-    if (gResolutionScale.load(std::memory_order_relaxed) >= 0.999) {
+    if (fabs(gResolutionScale.load(std::memory_order_relaxed) - 1.0) < 0.001) {
         %orig(drawableSize);
         return;
     }
 
     CGSize targetSize = GBPixelSizeForBounds(self.bounds.size);
     %orig(GBIsUsableSize(targetSize) ? targetSize : drawableSize);
+}
+
+%end
+
+
+%hook CADisplayLink
+
++ (CADisplayLink *)displayLinkWithTarget:(id)target selector:(SEL)selector {
+    CADisplayLink *displayLink = %orig(target, selector);
+    GBRegisterDisplayLink(displayLink);
+    return displayLink;
+}
+
+- (void)setPreferredFramesPerSecond:(NSInteger)preferredFramesPerSecond {
+    if (!gApplyingDisplayLinkFPS) {
+        objc_setAssociatedObject(self,
+                                 GBOriginalDisplayLinkFPSKey,
+                                 @(preferredFramesPerSecond),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    %orig(gApplyingDisplayLinkFPS
+        ? preferredFramesPerSecond
+        : GBEffectiveFrameRate(preferredFramesPerSecond));
 }
 
 %end
@@ -997,7 +2114,7 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         return;
     }
 
-    if (gResolutionScale.load(std::memory_order_relaxed) >= 0.999) {
+    if (fabs(gResolutionScale.load(std::memory_order_relaxed) - 1.0) < 0.001) {
         %orig(drawableSize);
         return;
     }
@@ -1007,8 +2124,140 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
 }
 
 - (id)nextDrawable {
+    GBApplyMetalLayerOptions(self);
     GBApplyQoSToCurrentRenderThread();
     return %orig;
+}
+
+%end
+
+
+%hook MTLSamplerDescriptor
+
+- (instancetype)init {
+    MTLSamplerDescriptor *descriptor = %orig;
+    if (descriptor != nil && GBIsEnhanceGraphicsActive()) {
+        if (gLinearFilteringEnabled.load(std::memory_order_relaxed)) {
+            descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+            descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+        }
+        if (gTrilinearFilteringEnabled.load(std::memory_order_relaxed)) {
+            descriptor.mipFilter = MTLSamplerMipFilterLinear;
+        }
+        descriptor.maxAnisotropy =
+            (NSUInteger)gAnisotropyLevel.load(std::memory_order_relaxed);
+    }
+    return descriptor;
+}
+
+- (void)setMinFilter:(MTLSamplerMinMagFilter)minFilter {
+    if (!gApplyingSamplerSettings) {
+        objc_setAssociatedObject(self,
+                                 GBRequestedSamplerMinKey,
+                                 @(minFilter),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (!self.normalizedCoordinates) {
+        %orig(minFilter);
+        if (!gApplyingSamplerSettings) {
+            gApplyingSamplerSettings = YES;
+            self.magFilter = minFilter;
+            self.mipFilter = MTLSamplerMipFilterNotMipmapped;
+            self.maxAnisotropy = 1;
+            gApplyingSamplerSettings = NO;
+        }
+        return;
+    }
+    if (!gApplyingSamplerSettings && GBIsEnhanceGraphicsActive() &&
+        gLinearFilteringEnabled.load(std::memory_order_relaxed) &&
+        self.normalizedCoordinates) {
+        minFilter = MTLSamplerMinMagFilterLinear;
+    }
+    %orig(minFilter);
+}
+
+- (void)setMagFilter:(MTLSamplerMinMagFilter)magFilter {
+    if (!gApplyingSamplerSettings) {
+        objc_setAssociatedObject(self,
+                                 GBRequestedSamplerMagKey,
+                                 @(magFilter),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (!self.normalizedCoordinates) {
+        %orig(magFilter);
+        if (!gApplyingSamplerSettings) {
+            gApplyingSamplerSettings = YES;
+            self.minFilter = magFilter;
+            self.mipFilter = MTLSamplerMipFilterNotMipmapped;
+            self.maxAnisotropy = 1;
+            gApplyingSamplerSettings = NO;
+        }
+        return;
+    }
+    if (!gApplyingSamplerSettings && GBIsEnhanceGraphicsActive() &&
+        gLinearFilteringEnabled.load(std::memory_order_relaxed) &&
+        self.normalizedCoordinates) {
+        magFilter = MTLSamplerMinMagFilterLinear;
+    }
+    %orig(magFilter);
+}
+
+- (void)setMipFilter:(MTLSamplerMipFilter)mipFilter {
+    if (!gApplyingSamplerSettings) {
+        objc_setAssociatedObject(self,
+                                 GBRequestedSamplerMipKey,
+                                 @(mipFilter),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (!self.normalizedCoordinates) {
+        mipFilter = MTLSamplerMipFilterNotMipmapped;
+    } else if (!gApplyingSamplerSettings && GBIsEnhanceGraphicsActive() &&
+        gTrilinearFilteringEnabled.load(std::memory_order_relaxed) &&
+        self.normalizedCoordinates) {
+        mipFilter = MTLSamplerMipFilterLinear;
+    }
+    %orig(mipFilter);
+}
+
+- (void)setMaxAnisotropy:(NSUInteger)maxAnisotropy {
+    if (!gApplyingSamplerSettings) {
+        objc_setAssociatedObject(self,
+                                 GBRequestedSamplerAnisotropyKey,
+                                 @(maxAnisotropy),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (!self.normalizedCoordinates) {
+        maxAnisotropy = 1;
+    } else if (!gApplyingSamplerSettings && GBIsEnhanceGraphicsActive() &&
+        self.normalizedCoordinates) {
+        maxAnisotropy = MAX(maxAnisotropy,
+            (NSUInteger)gAnisotropyLevel.load(std::memory_order_relaxed));
+    }
+    %orig(maxAnisotropy);
+}
+
+- (void)setNormalizedCoordinates:(BOOL)normalizedCoordinates {
+    %orig(normalizedCoordinates);
+    if (normalizedCoordinates) {
+        return;
+    }
+
+    // Metal requires non-normalized samplers to use matching min/mag filters,
+    // no mip filtering and anisotropy 1. Restore a safe form of the game's
+    // requested descriptor instead of leaving the graphics override invalid.
+    NSNumber *requestedMin = objc_getAssociatedObject(self, GBRequestedSamplerMinKey);
+    NSNumber *requestedMag = objc_getAssociatedObject(self, GBRequestedSamplerMagKey);
+    MTLSamplerMinMagFilter safeFilter = requestedMin != nil
+        ? (MTLSamplerMinMagFilter)requestedMin.unsignedIntegerValue
+        : requestedMag != nil
+            ? (MTLSamplerMinMagFilter)requestedMag.unsignedIntegerValue
+            : MTLSamplerMinMagFilterNearest;
+    gApplyingSamplerSettings = YES;
+    self.minFilter = safeFilter;
+    self.magFilter = safeFilter;
+    self.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    self.maxAnisotropy = 1;
+    gApplyingSamplerSettings = NO;
 }
 
 %end
@@ -1026,21 +2275,91 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
         gOriginalMainScreenScale = MAX(1.0, gMainScreen.scale);
         gOriginalMainNativeScale = MAX(1.0, gMainScreen.nativeScale);
         gOriginalMainNativeBounds = gMainScreen.nativeBounds;
+        gMaximumFramesPerSecond = MAX(60, gMainScreen.maximumFramesPerSecond);
         gOriginalMainScreenModeSize = gMainScreenMode != nil
             ? gMainScreenMode.size
             : gOriginalMainNativeBounds.size;
         double savedScale = [defaults objectForKey:GBResolutionScaleKey] == nil
             ? 1.0
             : [defaults doubleForKey:GBResolutionScaleKey];
+        double savedGraphicsScale = [defaults objectForKey:GBGraphicsScaleKey] == nil
+            ? 1.0
+            : [defaults doubleForKey:GBGraphicsScaleKey];
+        const BOOL hasLegacyConfiguration =
+            [defaults objectForKey:GBPerformanceKey] != nil ||
+            [defaults objectForKey:GBResolutionScaleKey] != nil ||
+            [defaults objectForKey:GBLandscapeLockKey] != nil;
+        NSInteger savedModeValue = [defaults objectForKey:GBModuleModeKey] == nil
+            ? (hasLegacyConfiguration ? GBModuleModeGameBoost : GBModuleModeNone)
+            : [defaults integerForKey:GBModuleModeKey];
+        GBModuleMode savedMode = savedModeValue == GBModuleModeGameBoost ||
+                savedModeValue == GBModuleModeEnhanceGraphics
+            ? (GBModuleMode)savedModeValue
+            : GBModuleModeNone;
         BOOL savedPerformance = [defaults boolForKey:GBPerformanceKey];
         BOOL savedLandscapeLock = [defaults boolForKey:GBLandscapeLockKey];
 
-        const double initialScale = GBClampScale(savedScale);
+        const double gameScale = GBClampGameScale(savedScale);
+        const double graphicsScale = GBClampGraphicsScale(savedGraphicsScale);
+        const double initialScale = savedMode == GBModuleModeGameBoost
+            ? gameScale
+            : savedMode == GBModuleModeEnhanceGraphics
+                ? graphicsScale
+                : 1.0;
+        gLaunchedModuleMode = savedMode;
+        gModuleMode.store((int)savedMode, std::memory_order_relaxed);
         gResolutionScale.store(initialScale, std::memory_order_relaxed);
-        gConfiguredResolutionScale.store(initialScale, std::memory_order_relaxed);
-        gPerformanceEnabled.store(savedPerformance && GBThermalStateAllowsBoost(),
-                                  std::memory_order_relaxed);
+        gConfiguredResolutionScale.store(gameScale, std::memory_order_relaxed);
+        gConfiguredGraphicsScale.store(graphicsScale, std::memory_order_relaxed);
+        gPerformanceEnabled.store(savedPerformance, std::memory_order_relaxed);
         gLandscapeLockEnabled.store(savedLandscapeLock, std::memory_order_relaxed);
+        gFrameRate.store(GBSanitizeFrameRate([defaults integerForKey:GBFrameRateKey]),
+                         std::memory_order_relaxed);
+        gLowLatencyEnabled.store([defaults boolForKey:GBLowLatencyKey],
+                                 std::memory_order_relaxed);
+        gKeepAwakeEnabled.store([defaults boolForKey:GBKeepAwakeKey],
+                               std::memory_order_relaxed);
+        gLinearFilteringEnabled.store([defaults objectForKey:GBLinearFilteringKey] == nil
+                ? YES
+                : [defaults boolForKey:GBLinearFilteringKey],
+            std::memory_order_relaxed);
+        gTrilinearFilteringEnabled.store([defaults objectForKey:GBTrilinearFilteringKey] == nil
+                ? YES
+                : [defaults boolForKey:GBTrilinearFilteringKey],
+            std::memory_order_relaxed);
+        NSInteger savedAnisotropy = [defaults objectForKey:GBAnisotropyKey] == nil
+            ? 4
+            : [defaults integerForKey:GBAnisotropyKey];
+        gAnisotropyLevel.store(GBSanitizeAnisotropy(savedAnisotropy),
+                               std::memory_order_relaxed);
+        gWideColorEnabled.store([defaults boolForKey:GBWideColorKey],
+                                std::memory_order_relaxed);
+        gHighQualityScalingEnabled.store([defaults objectForKey:GBHighQualityScalingKey] == nil
+                ? YES
+                : [defaults boolForKey:GBHighQualityScalingKey],
+            std::memory_order_relaxed);
+        gMenuScale.store(GBClampMenuScale([defaults objectForKey:GBMenuScaleKey] == nil
+                ? 1.0
+                : [defaults doubleForKey:GBMenuScaleKey]),
+            std::memory_order_relaxed);
+        gMenuDragEnabled.store([defaults objectForKey:GBMenuDragKey] == nil
+                ? YES
+                : [defaults boolForKey:GBMenuDragKey],
+            std::memory_order_relaxed);
+        gMenuHue.store(GBClampUnit([defaults objectForKey:GBMenuHueKey] == nil
+                ? 0.55
+                : [defaults doubleForKey:GBMenuHueKey], 0.55),
+            std::memory_order_relaxed);
+        double savedOpacity = [defaults objectForKey:GBMenuOpacityKey] == nil
+            ? 0.96
+            : [defaults doubleForKey:GBMenuOpacityKey];
+        gMenuOpacity.store(fmin(1.0, fmax(0.45, savedOpacity)),
+                           std::memory_order_relaxed);
+        gLiquidGlassEnabled.store([defaults objectForKey:GBLiquidGlassKey] == nil
+                ? YES
+                : [defaults boolForKey:GBLiquidGlassKey],
+            std::memory_order_relaxed);
+        gDisplayLinks = [NSHashTable weakObjectsHashTable];
 
         %init;
 
@@ -1050,25 +2369,22 @@ static void GBSetResolutionScale(double scale, BOOL persist) {
                                                     usingBlock:^(__unused NSNotification *notification) {
             [[OAGameBoostOverlayManager sharedManager] installIfPossible];
             GBRefreshApplicationResolution();
+            GBRefreshFrameRateTargets();
+            GBRefreshMetalOptions();
+            GBUpdateIdleTimerOverride();
             if (GBShouldKeepLandscape()) {
                 GBRequestOrientationUpdate();
             }
         }];
 
-        [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification
-                                                        object:nil
-                                                         queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(__unused NSNotification *notification) {
-            if (!GBThermalStateAllowsBoost() &&
-                gPerformanceEnabled.load(std::memory_order_relaxed)) {
-                GBSetPerformanceEnabled(NO, YES);
-            }
-        }];
-
         dispatch_async(dispatch_get_main_queue(), ^{
-            GBUpdateProcessActivity(gPerformanceEnabled.load(std::memory_order_relaxed));
+            GBUpdateProcessActivity(GBIsGameBoostActive() &&
+                gPerformanceEnabled.load(std::memory_order_relaxed));
+            GBUpdateIdleTimerOverride();
             [[OAGameBoostOverlayManager sharedManager] installIfPossible];
             GBRefreshApplicationResolution();
+            GBRefreshFrameRateTargets();
+            GBRefreshMetalOptions();
             if (GBShouldKeepLandscape()) {
                 GBRequestOrientationUpdate();
             }

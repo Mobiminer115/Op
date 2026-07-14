@@ -13,6 +13,6 @@ TWEAK_NAME = GameBoost
 GameBoost_FILES = Tweak.xm
 GameBoost_CFLAGS = -fobjc-arc
 GameBoost_CCFLAGS = -std=c++17
-GameBoost_FRAMEWORKS = Foundation UIKit QuartzCore MetalKit
+GameBoost_FRAMEWORKS = Foundation UIKit QuartzCore Metal MetalKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk

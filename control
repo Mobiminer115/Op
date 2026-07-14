@@ -1,8 +1,8 @@
 Package: com.gameboost.universal
 Name: GameBoost Universal
-Version: 1.3.1
+Version: 2.0.0
 Architecture: iphoneos-arm
-Description: Universal UIKit overlay with render QoS, true per-app resolution downscaling, and landscape lock override.
+Description: Exclusive GameBoost and Enhance Graphic modules with a customizable three-tab overlay for UIKit and Metal games.
 Maintainer: GameBoost
 Author: GameBoost
 Section: Tweaks
