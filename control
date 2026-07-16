@@ -1,8 +1,8 @@
 Package: com.gameboost.universal
 Name: GameBoost Universal
-Version: 3.0.0
+Version: 3.1.0
 Architecture: iphoneos-arm
-Description: GameBoost, Enhance Graphic and per-app iPad presets in a redesigned four-tab glass overlay for UIKit and Metal games.
+Description: GameBoost and Enhance Graphic in a three-tab Liquid Glass overlay for UIKit and Metal games.
 Maintainer: GameBoost
 Author: GameBoost
 Section: Tweaks

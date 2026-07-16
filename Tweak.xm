@@ -5,23 +5,14 @@
 #import <MetalKit/MTKView.h>
 #import <pthread/qos.h>
 #import <objc/runtime.h>
-#import <sys/sysctl.h>
-#import <sys/utsname.h>
-#import <errno.h>
 
 #include <atomic>
 #include <cmath>
-#include <cstring>
 
 typedef NS_ENUM(NSInteger, GBModuleMode) {
     GBModuleModeNone = 0,
     GBModuleModeGameBoost = 1,
     GBModuleModeEnhanceGraphics = 2,
-};
-
-typedef NS_ENUM(NSInteger, GBIpadProfile) {
-    GBIpadProfileRobloxTablet = 0,
-    GBIpadProfilePUBGView = 1,
 };
 
 static NSString * const GBModuleModeKey = @"com.gameboost.universal.module-mode";
@@ -42,8 +33,6 @@ static NSString * const GBMenuDragKey = @"com.gameboost.universal.menu-drag";
 static NSString * const GBMenuHueKey = @"com.gameboost.universal.menu-hue";
 static NSString * const GBMenuOpacityKey = @"com.gameboost.universal.menu-opacity";
 static NSString * const GBLiquidGlassKey = @"com.gameboost.universal.liquid-glass";
-static NSString * const GBIpadModeEnabledKey = @"com.gameboost.universal.ipad-mode-enabled";
-static NSString * const GBIpadProfileKey = @"com.gameboost.universal.ipad-profile";
 static NSString * const GBSettingsDidChangeNotification = @"com.gameboost.universal.settings-changed";
 
 static std::atomic<int> gModuleMode((int)GBModuleModeNone);
@@ -64,14 +53,6 @@ static std::atomic_bool gMenuDragEnabled(true);
 static std::atomic<double> gMenuHue(0.55);
 static std::atomic<double> gMenuOpacity(0.96);
 static std::atomic_bool gLiquidGlassEnabled(true);
-// iPad settings are deliberately split into configured and launched state.
-// UIKit traits and game renderers cache their device class/viewport during
-// startup, so switching profiles in a live process would leave a half-phone,
-// half-tablet UI. The menu saves changes and marks them for the next launch.
-static std::atomic_bool gConfiguredIpadModeEnabled(false);
-static std::atomic<int> gConfiguredIpadProfile((int)GBIpadProfileRobloxTablet);
-static BOOL gLaunchedIpadModeEnabled = NO;
-static GBIpadProfile gLaunchedIpadProfile = GBIpadProfileRobloxTablet;
 // gResolutionScale is the scale currently active in the renderer. The menu
 // writes one of the configured scales; the selected module and scale become
 // active on the next app launch so cached engine viewports never half-update.
@@ -120,66 +101,6 @@ static BOOL GBIsGameBoostActive(void) {
 
 static BOOL GBIsEnhanceGraphicsActive(void) {
     return GBCurrentModuleMode() == GBModuleModeEnhanceGraphics;
-}
-
-static GBIpadProfile GBSanitizeIpadProfile(NSInteger profile) {
-    return profile == GBIpadProfilePUBGView
-        ? GBIpadProfilePUBGView
-        : GBIpadProfileRobloxTablet;
-}
-
-static BOOL GBIsIpadModeActive(void) {
-    return gLaunchedIpadModeEnabled;
-}
-
-static BOOL GBIsPUBGIpadViewActive(void) {
-    return GBIsIpadModeActive() &&
-        gLaunchedIpadProfile == GBIpadProfilePUBGView;
-}
-
-static const char *GBIpadMachineIdentifier(void) {
-    return gLaunchedIpadProfile == GBIpadProfilePUBGView
-        ? "iPad14,6"
-        : "iPad14,3";
-}
-
-static int GBWriteSpoofedCString(const char *value,
-                                 void *oldValue,
-                                 size_t *oldLength) {
-    if (value == nullptr || oldLength == nullptr) {
-        errno = EINVAL;
-        return -1;
-    }
-    const size_t requiredLength = std::strlen(value) + 1;
-    if (oldValue == nullptr) {
-        *oldLength = requiredLength;
-        return 0;
-    }
-    const size_t availableLength = *oldLength;
-    *oldLength = requiredLength;
-    if (availableLength < requiredLength) {
-        errno = ENOMEM;
-        return -1;
-    }
-    std::memcpy(oldValue, value, requiredLength);
-    return 0;
-}
-
-static CGSize GBApplyIpadViewportAspect(CGSize size) {
-    if (!GBIsPUBGIpadViewActive() || size.width <= 0.0 || size.height <= 0.0 ||
-        !std::isfinite(size.width) || !std::isfinite(size.height)) {
-        return size;
-    }
-
-    // PUBG's experimental profile feeds the renderer a 4:3 backing surface
-    // while keeping UIKit's logical view/touch bounds unchanged. The shorter
-    // long edge is then composed to the physical phone display by CoreAnimation.
-    if (size.width >= size.height) {
-        size.width = MAX(1.0, round(size.height * (4.0 / 3.0)));
-    } else {
-        size.height = MAX(1.0, round(size.width * (4.0 / 3.0)));
-    }
-    return size;
 }
 
 static double GBClampGameScale(double scale) {
@@ -240,9 +161,8 @@ static CGSize GBPixelSizeForBounds(CGSize boundsSize) {
     }
 
     const CGFloat screenScale = GBCurrentScreenScale();
-    CGSize pixelSize = CGSizeMake(MAX(1.0, round(boundsSize.width * screenScale)),
-                                  MAX(1.0, round(boundsSize.height * screenScale)));
-    return GBApplyIpadViewportAspect(pixelSize);
+    return CGSizeMake(MAX(1.0, round(boundsSize.width * screenScale)),
+                      MAX(1.0, round(boundsSize.height * screenScale)));
 }
 
 static BOOL GBShouldLoadInCurrentProcess(void) {
@@ -951,27 +871,6 @@ static void GBUpdateIdleTimerOverride(void) {
     }
 }
 
-static void GBSetIpadModeEnabled(BOOL enabled, BOOL persist) {
-    gConfiguredIpadModeEnabled.store(enabled, std::memory_order_relaxed);
-    if (persist) {
-        [NSUserDefaults.standardUserDefaults setBool:enabled
-                                              forKey:GBIpadModeEnabledKey];
-        [NSUserDefaults.standardUserDefaults synchronize];
-    }
-    GBPostSettingsChanged();
-}
-
-static void GBSetIpadProfile(GBIpadProfile profile, BOOL persist) {
-    profile = GBSanitizeIpadProfile(profile);
-    gConfiguredIpadProfile.store((int)profile, std::memory_order_relaxed);
-    if (persist) {
-        [NSUserDefaults.standardUserDefaults setInteger:profile
-                                                 forKey:GBIpadProfileKey];
-        [NSUserDefaults.standardUserDefaults synchronize];
-    }
-    GBPostSettingsChanged();
-}
-
 static void GBSetModuleMode(GBModuleMode mode, BOOL persist) {
     if (mode != GBModuleModeNone &&
         mode != GBModuleModeGameBoost &&
@@ -1074,30 +973,26 @@ static UIColor *GBThemeColor(void) {
 @property(nonatomic, strong) UIVisualEffectView *menuButtonGlass;
 @property(nonatomic, strong) UIView *panel;
 @property(nonatomic, strong) UIVisualEffectView *glassView;
+@property(nonatomic, strong) UIView *glassTintView;
 @property(nonatomic, strong) UIView *shineView;
 @property(nonatomic, strong) CAGradientLayer *shineGradient;
+@property(nonatomic, strong) CAGradientLayer *glassRimGradient;
+@property(nonatomic, strong) CAShapeLayer *glassRimMask;
 @property(nonatomic, strong) UIView *sidebar;
 @property(nonatomic, strong) UIView *gameTabRow;
 @property(nonatomic, strong) UIView *graphicsTabRow;
-@property(nonatomic, strong) UIView *ipadTabRow;
 @property(nonatomic, strong) UIView *settingsTabRow;
 @property(nonatomic, strong) UIButton *gameTabButton;
 @property(nonatomic, strong) UIButton *graphicsTabButton;
-@property(nonatomic, strong) UIButton *ipadTabButton;
 @property(nonatomic, strong) UIButton *settingsTabButton;
 @property(nonatomic, strong) UISwitch *gameMasterSwitch;
 @property(nonatomic, strong) UISwitch *graphicsMasterSwitch;
-@property(nonatomic, strong) UISwitch *ipadMasterSwitch;
 @property(nonatomic, strong) UIButton *closeButton;
 @property(nonatomic, strong) UIScrollView *gameScroll;
 @property(nonatomic, strong) UIScrollView *graphicsScroll;
-@property(nonatomic, strong) UIScrollView *ipadScroll;
 @property(nonatomic, strong) UIScrollView *settingsScroll;
 @property(nonatomic, strong) UILabel *gameStatusLabel;
 @property(nonatomic, strong) UILabel *graphicsStatusLabel;
-@property(nonatomic, strong) UILabel *ipadStatusLabel;
-@property(nonatomic, strong) UISegmentedControl *ipadProfileControl;
-@property(nonatomic, strong) UILabel *ipadProfileHintLabel;
 @property(nonatomic, strong) UISwitch *performanceSwitch;
 @property(nonatomic, strong) UISwitch *lowLatencySwitch;
 @property(nonatomic, strong) UISwitch *keepAwakeSwitch;
@@ -1155,10 +1050,10 @@ static UIColor *GBThemeColor(void) {
                                                             width - 20.0,
                                                             66.0)];
     card.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.055];
-    card.layer.cornerRadius = 15.0;
+    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.040];
+    card.layer.cornerRadius = 18.0;
     card.layer.borderWidth = 0.6;
-    card.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.10].CGColor;
+    card.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.075].CGColor;
     card.userInteractionEnabled = NO;
     [scroll addSubview:card];
 
@@ -1222,12 +1117,55 @@ static UIColor *GBThemeColor(void) {
     return button;
 }
 
+- (UIVisualEffect *)glassEffectWithTint:(UIColor *)tint interactive:(BOOL)interactive {
+    // UIGlassEffect ships with iOS 26, but this project is intentionally built
+    // with the iOS 18 SDK as well. Resolve it at runtime so one package can use
+    // the real material when available and keep a stable fallback on iOS 12–18.
+    Class glassClass = NSClassFromString(@"UIGlassEffect");
+    if (glassClass != Nil) {
+        id effect = [[glassClass alloc] init];
+        @try {
+            if ([effect respondsToSelector:NSSelectorFromString(@"setTintColor:")]) {
+                [effect setValue:tint forKey:@"tintColor"];
+            }
+            if ([effect respondsToSelector:NSSelectorFromString(@"setInteractive:")]) {
+                [effect setValue:@(interactive) forKey:@"interactive"];
+            }
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        if ([effect isKindOfClass:UIVisualEffect.class]) {
+            return (UIVisualEffect *)effect;
+        }
+    }
+
+    if (@available(iOS 13.0, *)) {
+        return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
+    }
+    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
+}
+
+- (void)updateNativeGlassView:(UIVisualEffectView *)effectView
+                    tintColor:(UIColor *)tintColor {
+    Class glassClass = NSClassFromString(@"UIGlassEffect");
+    id effect = effectView.effect;
+    if (glassClass == Nil || ![effect isKindOfClass:glassClass]) {
+        return;
+    }
+
+    @try {
+        if ([effect respondsToSelector:NSSelectorFromString(@"setTintColor:")]) {
+            [effect setValue:tintColor forKey:@"tintColor"];
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.clearColor;
-    self.selectedTab = GBIsEnhanceGraphicsActive()
-        ? 1
-        : (gConfiguredIpadModeEnabled.load(std::memory_order_relaxed) ? 2 : 0);
+    self.selectedTab = GBIsEnhanceGraphicsActive() ? 1 : 0;
 
     self.menuButton = [UIButton buttonWithType:UIButtonTypeCustom];
     self.menuButton.frame = CGRectMake(16.0, 96.0, 48.0, 48.0);
@@ -1242,13 +1180,9 @@ static UIColor *GBThemeColor(void) {
     self.menuButton.accessibilityLabel = @"Open GameBoost menu";
     [self.menuButton setTitle:@"G" forState:UIControlStateNormal];
     [self.menuButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    UIBlurEffect *buttonBlur = nil;
-    if (@available(iOS 13.0, *)) {
-        buttonBlur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
-    } else {
-        buttonBlur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
-    }
-    self.menuButtonGlass = [[UIVisualEffectView alloc] initWithEffect:buttonBlur];
+    UIVisualEffect *buttonEffect = [self glassEffectWithTint:
+        [GBThemeColor() colorWithAlphaComponent:0.16] interactive:YES];
+    self.menuButtonGlass = [[UIVisualEffectView alloc] initWithEffect:buttonEffect];
     self.menuButtonGlass.frame = self.menuButton.bounds;
     self.menuButtonGlass.autoresizingMask = UIViewAutoresizingFlexibleWidth |
         UIViewAutoresizingFlexibleHeight;
@@ -1275,17 +1209,19 @@ static UIColor *GBThemeColor(void) {
     self.panel.hidden = YES;
     [self.view addSubview:self.panel];
 
-    UIBlurEffect *blurEffect = nil;
-    if (@available(iOS 13.0, *)) {
-        blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
-    } else {
-        blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
-    }
-    self.glassView = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
+    UIVisualEffect *panelEffect = [self glassEffectWithTint:
+        [GBThemeColor() colorWithAlphaComponent:0.12] interactive:NO];
+    self.glassView = [[UIVisualEffectView alloc] initWithEffect:panelEffect];
     self.glassView.userInteractionEnabled = NO;
     self.glassView.layer.cornerRadius = 28.0;
     self.glassView.layer.masksToBounds = YES;
     [self.panel addSubview:self.glassView];
+
+    self.glassTintView = [[UIView alloc] initWithFrame:self.panel.bounds];
+    self.glassTintView.userInteractionEnabled = NO;
+    self.glassTintView.layer.cornerRadius = 28.0;
+    self.glassTintView.layer.masksToBounds = YES;
+    [self.panel addSubview:self.glassTintView];
 
     self.shineView = [[UIView alloc] initWithFrame:self.panel.bounds];
     self.shineView.userInteractionEnabled = NO;
@@ -1295,6 +1231,16 @@ static UIColor *GBThemeColor(void) {
     self.shineGradient.startPoint = CGPointMake(0.0, 0.0);
     self.shineGradient.endPoint = CGPointMake(1.0, 1.0);
     [self.shineView.layer addSublayer:self.shineGradient];
+
+    self.glassRimGradient = [CAGradientLayer layer];
+    self.glassRimGradient.startPoint = CGPointMake(0.0, 0.0);
+    self.glassRimGradient.endPoint = CGPointMake(1.0, 1.0);
+    self.glassRimMask = [CAShapeLayer layer];
+    self.glassRimMask.fillColor = UIColor.clearColor.CGColor;
+    self.glassRimMask.strokeColor = UIColor.whiteColor.CGColor;
+    self.glassRimMask.lineWidth = 1.35;
+    self.glassRimGradient.mask = self.glassRimMask;
+    [self.shineView.layer addSublayer:self.glassRimGradient];
     [self.panel addSubview:self.shineView];
 
     self.sidebar = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, 148.0, 370.0)];
@@ -1305,7 +1251,7 @@ static UIColor *GBThemeColor(void) {
     self.sidebar.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
     [self.panel addSubview:self.sidebar];
 
-    UILabel *brandLabel = [self labelWithText:@"GameBoost\n3.0 • Glass"
+    UILabel *brandLabel = [self labelWithText:@"GameBoost\n3.1 • Liquid"
                                          frame:CGRectMake(16.0, 12.0, 112.0, 38.0)
                                           font:[UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold]
                                          color:UIColor.whiteColor];
@@ -1336,18 +1282,6 @@ static UIColor *GBThemeColor(void) {
                         forControlEvents:UIControlEventValueChanged];
     [self.graphicsTabRow addSubview:self.graphicsMasterSwitch];
 
-    self.ipadTabRow = [UIView new];
-    self.ipadTabRow.layer.cornerRadius = 14.0;
-    [self.sidebar addSubview:self.ipadTabRow];
-    self.ipadTabButton = [self sidebarButtonWithTitle:@"iPad Mode"
-                                             selector:@selector(selectIpadTab)];
-    [self.ipadTabRow addSubview:self.ipadTabButton];
-    self.ipadMasterSwitch = [UISwitch new];
-    [self.ipadMasterSwitch addTarget:self
-                              action:@selector(ipadMasterChanged:)
-                    forControlEvents:UIControlEventValueChanged];
-    [self.ipadTabRow addSubview:self.ipadMasterSwitch];
-
     self.settingsTabRow = [UIView new];
     self.settingsTabRow.layer.cornerRadius = 14.0;
     [self.sidebar addSubview:self.settingsTabRow];
@@ -1358,11 +1292,9 @@ static UIColor *GBThemeColor(void) {
     CGRect pageFrame = CGRectMake(148.0, 0.0, 362.0, 370.0);
     self.gameScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
     self.graphicsScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
-    self.ipadScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
     self.settingsScroll = [[UIScrollView alloc] initWithFrame:pageFrame];
     for (UIScrollView *scroll in @[self.gameScroll,
                                    self.graphicsScroll,
-                                   self.ipadScroll,
                                    self.settingsScroll]) {
         scroll.alwaysBounceVertical = YES;
         scroll.showsVerticalScrollIndicator = YES;
@@ -1372,7 +1304,6 @@ static UIColor *GBThemeColor(void) {
 
     [self buildGamePage];
     [self buildGraphicsPage];
-    [self buildIpadPage];
     [self buildSettingsPage];
 
     self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1563,74 +1494,6 @@ static UIColor *GBThemeColor(void) {
     self.graphicsScroll.contentSize = CGSizeMake(width, 644.0);
 }
 
-- (void)buildIpadPage {
-    const CGFloat width = CGRectGetWidth(self.ipadScroll.bounds);
-    [self addPageTitle:@"iPad Mode" to:self.ipadScroll];
-    self.ipadStatusLabel = [self addStatusLabelTo:self.ipadScroll y:48.0];
-
-    UILabel *intro = [self labelWithText:@"Hai preset gọn cho đúng mục tiêu. Thiết lập được lưu riêng trong từng app."
-                                    frame:CGRectMake(16.0, 82.0, width - 32.0, 42.0)
-                                     font:[UIFont systemFontOfSize:12.0 weight:UIFontWeightMedium]
-                                    color:[UIColor colorWithWhite:0.82 alpha:1.0]];
-    [self.ipadScroll addSubview:intro];
-
-    UIView *profileCard = [[UIView alloc] initWithFrame:CGRectMake(10.0,
-                                                                   130.0,
-                                                                   width - 20.0,
-                                                                   184.0)];
-    profileCard.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    profileCard.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.055];
-    profileCard.layer.cornerRadius = 17.0;
-    profileCard.layer.borderWidth = 0.6;
-    profileCard.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.10].CGColor;
-    profileCard.userInteractionEnabled = NO;
-    [self.ipadScroll addSubview:profileCard];
-
-    UILabel *profileLabel = [self labelWithText:@"Tablet profile"
-                                           frame:CGRectMake(18.0, 144.0, width - 36.0, 24.0)
-                                            font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
-                                           color:UIColor.whiteColor];
-    [self.ipadScroll addSubview:profileLabel];
-
-    self.ipadProfileControl = [[UISegmentedControl alloc]
-        initWithItems:@[@"Roblox UI", @"PUBG 4:3"]];
-    self.ipadProfileControl.frame = CGRectMake(18.0, 176.0, width - 36.0, 34.0);
-    self.ipadProfileControl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [self.ipadProfileControl addTarget:self
-                                action:@selector(ipadProfileChanged:)
-                      forControlEvents:UIControlEventValueChanged];
-    [self.ipadScroll addSubview:self.ipadProfileControl];
-
-    self.ipadProfileHintLabel = [self labelWithText:@""
-                                                frame:CGRectMake(18.0,
-                                                                 220.0,
-                                                                 width - 36.0,
-                                                                 78.0)
-                                                 font:[UIFont systemFontOfSize:11.0 weight:UIFontWeightRegular]
-                                                color:[UIColor colorWithWhite:0.72 alpha:1.0]];
-    [self.ipadScroll addSubview:self.ipadProfileHintLabel];
-
-    UILabel *relaunch = [self labelWithText:@"↻ Đổi trạng thái hoặc preset cần đóng hẳn rồi mở lại game. PUBG dùng surface 4:3 thử nghiệm; touch vẫn giữ theo bounds thật."
-                                         frame:CGRectMake(16.0, 326.0, width - 32.0, 58.0)
-                                          font:[UIFont systemFontOfSize:11.0 weight:UIFontWeightMedium]
-                                         color:[UIColor colorWithRed:1.0 green:0.78 blue:0.42 alpha:1.0]];
-    [self.ipadScroll addSubview:relaunch];
-
-    UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    resetButton.frame = CGRectMake(16.0, 392.0, width - 32.0, 36.0);
-    resetButton.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    resetButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.075];
-    resetButton.layer.cornerRadius = 12.0;
-    resetButton.layer.borderWidth = 0.6;
-    resetButton.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.10].CGColor;
-    [resetButton setTitle:@"Khôi phục thiết bị thật" forState:UIControlStateNormal];
-    [resetButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [resetButton addTarget:self action:@selector(resetIpadMode)
-          forControlEvents:UIControlEventTouchUpInside];
-    [self.ipadScroll addSubview:resetButton];
-    self.ipadScroll.contentSize = CGSizeMake(width, 446.0);
-}
-
 - (void)buildSettingsPage {
     const CGFloat width = CGRectGetWidth(self.settingsScroll.bounds);
     [self addPageTitle:@"Settings" to:self.settingsScroll];
@@ -1674,7 +1537,7 @@ static UIColor *GBThemeColor(void) {
               forControlEvents:UIControlEventValueChanged];
     [self.settingsScroll addSubview:self.hueSlider];
 
-    UILabel *opacityLabel = [self labelWithText:@"Độ trong suốt"
+    UILabel *opacityLabel = [self labelWithText:@"Độ đậm của kính"
                                            frame:CGRectMake(16.0, 298.0, width - 100.0, 24.0)
                                             font:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
                                            color:UIColor.whiteColor];
@@ -1695,8 +1558,8 @@ static UIColor *GBThemeColor(void) {
     [self.settingsScroll addSubview:self.opacitySlider];
 
     self.liquidGlassSwitch = [self addSwitchRowTo:self.settingsScroll
-                                            title:@"Liquid Glass"
-                                             hint:@"Material blur, hairline và highlight mềm • iOS 12–18."
+                                            title:@"Liquid Glass 26"
+                                             hint:@"Kính nổi, tint động và viền phản quang • fallback iOS 12–18."
                                                 y:380.0
                                          selector:@selector(liquidGlassChanged:)];
     UILabel *settingsHint = [self labelWithText:@"Settings luôn hoạt động, kể cả khi hai module đang tắt."
@@ -1767,16 +1630,21 @@ static UIColor *GBThemeColor(void) {
     [self clampPanel];
 
     self.glassView.frame = self.panel.bounds;
+    self.glassTintView.frame = self.panel.bounds;
     self.shineView.frame = self.panel.bounds;
     self.shineGradient.frame = self.shineView.bounds;
+    self.glassRimGradient.frame = self.shineView.bounds;
+    CGRect rimRect = CGRectInset(self.shineView.bounds, 0.75, 0.75);
+    self.glassRimMask.frame = self.shineView.bounds;
+    self.glassRimMask.path = [UIBezierPath bezierPathWithRoundedRect:rimRect
+                                                       cornerRadius:27.25].CGPath;
     const CGFloat sidebarWidth = MIN(154.0, MAX(136.0, width * 0.30));
     self.sidebar.frame = CGRectMake(0.0, 0.0, sidebarWidth, height);
 
     self.gameTabRow.frame = CGRectMake(8.0, 54.0, sidebarWidth - 16.0, 48.0);
     self.graphicsTabRow.frame = CGRectMake(8.0, 108.0, sidebarWidth - 16.0, 48.0);
-    self.ipadTabRow.frame = CGRectMake(8.0, 162.0, sidebarWidth - 16.0, 48.0);
     self.settingsTabRow.frame = CGRectMake(8.0,
-                                           MIN(216.0, height - 54.0),
+                                           MIN(162.0, height - 54.0),
                                            sidebarWidth - 16.0,
                                            46.0);
     CGFloat rowWidth = CGRectGetWidth(self.gameTabRow.bounds);
@@ -1785,9 +1653,6 @@ static UIColor *GBThemeColor(void) {
     rowWidth = CGRectGetWidth(self.graphicsTabRow.bounds);
     self.graphicsTabButton.frame = CGRectMake(8.0, 0.0, MAX(40.0, rowWidth - 58.0), 48.0);
     self.graphicsMasterSwitch.frame = CGRectMake(MAX(0.0, rowWidth - 52.0), 8.0, 51.0, 31.0);
-    rowWidth = CGRectGetWidth(self.ipadTabRow.bounds);
-    self.ipadTabButton.frame = CGRectMake(8.0, 0.0, MAX(40.0, rowWidth - 58.0), 48.0);
-    self.ipadMasterSwitch.frame = CGRectMake(MAX(0.0, rowWidth - 52.0), 8.0, 51.0, 31.0);
     self.settingsTabButton.frame = CGRectMake(8.0, 0.0,
                                               CGRectGetWidth(self.settingsTabRow.bounds) - 16.0,
                                               46.0);
@@ -1795,7 +1660,6 @@ static UIColor *GBThemeColor(void) {
     CGRect pageFrame = CGRectMake(sidebarWidth, 0.0, width - sidebarWidth, height);
     for (UIScrollView *scroll in @[self.gameScroll,
                                    self.graphicsScroll,
-                                   self.ipadScroll,
                                    self.settingsScroll]) {
         scroll.frame = pageFrame;
         scroll.contentSize = CGSizeMake(CGRectGetWidth(pageFrame), scroll.contentSize.height);
@@ -1851,100 +1715,107 @@ static UIColor *GBThemeColor(void) {
 
 - (void)applyVisualSettings {
     UIColor *theme = GBThemeColor();
+    const CGFloat density = (CGFloat)fmin(1.0, fmax(0.45,
+        gMenuOpacity.load(std::memory_order_relaxed)));
+    const CGFloat strength = (density - 0.45) / 0.55;
+    const BOOL glass = gLiquidGlassEnabled.load(std::memory_order_relaxed);
+
+    // Never fade the whole hierarchy: doing that leaves the blur fully opaque
+    // while dimming every control above it. The slider now changes the glass
+    // layers themselves, so tint and density update immediately and separately.
+    self.panel.alpha = 1.0;
     self.menuButton.layer.borderColor =
-        [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
+        [UIColor colorWithWhite:1.0 alpha:0.34].CGColor;
     self.panel.layer.borderColor =
-        [UIColor colorWithWhite:1.0 alpha:0.18].CGColor;
-    self.panel.alpha = (CGFloat)gMenuOpacity.load(std::memory_order_relaxed);
-    self.sidebar.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.13];
+        [UIColor colorWithWhite:1.0 alpha:0.24].CGColor;
+    self.panel.layer.shadowOpacity = glass ? 0.38 : 0.46;
+    self.sidebar.backgroundColor = glass
+        ? [UIColor colorWithWhite:0.0 alpha:0.10 + 0.07 * strength]
+        : [UIColor colorWithWhite:0.0 alpha:0.23];
     [self applyTintToView:self.panel color:theme];
 
     self.gameTabRow.backgroundColor = self.selectedTab == 0
-        ? [UIColor colorWithWhite:1.0 alpha:0.105]
+        ? [theme colorWithAlphaComponent:0.13]
         : UIColor.clearColor;
     self.graphicsTabRow.backgroundColor = self.selectedTab == 1
-        ? [UIColor colorWithWhite:1.0 alpha:0.105]
+        ? [theme colorWithAlphaComponent:0.13]
         : UIColor.clearColor;
-    self.ipadTabRow.backgroundColor = self.selectedTab == 2
-        ? [UIColor colorWithWhite:1.0 alpha:0.105]
+    self.settingsTabRow.backgroundColor = self.selectedTab == 2
+        ? [theme colorWithAlphaComponent:0.13]
         : UIColor.clearColor;
-    self.settingsTabRow.backgroundColor = self.selectedTab == 3
-        ? [UIColor colorWithWhite:1.0 alpha:0.105]
-        : UIColor.clearColor;
+    for (UIView *tabRow in @[self.gameTabRow,
+                             self.graphicsTabRow,
+                             self.settingsTabRow]) {
+        const BOOL selected = (tabRow == self.gameTabRow && self.selectedTab == 0) ||
+            (tabRow == self.graphicsTabRow && self.selectedTab == 1) ||
+            (tabRow == self.settingsTabRow && self.selectedTab == 2);
+        tabRow.layer.borderWidth = 0.6;
+        tabRow.layer.borderColor = selected
+            ? [UIColor colorWithWhite:1.0 alpha:0.17].CGColor
+            : UIColor.clearColor.CGColor;
+    }
     self.gameStatusLabel.backgroundColor = GBIsGameBoostActive()
-        ? [theme colorWithAlphaComponent:0.20]
-        : [UIColor colorWithWhite:1.0 alpha:0.065];
+        ? [theme colorWithAlphaComponent:0.18]
+        : [UIColor colorWithWhite:1.0 alpha:0.055];
     self.graphicsStatusLabel.backgroundColor = GBIsEnhanceGraphicsActive()
-        ? [theme colorWithAlphaComponent:0.20]
-        : [UIColor colorWithWhite:1.0 alpha:0.065];
-    self.ipadStatusLabel.backgroundColor =
-        gConfiguredIpadModeEnabled.load(std::memory_order_relaxed)
-            ? [theme colorWithAlphaComponent:0.20]
-            : [UIColor colorWithWhite:1.0 alpha:0.065];
+        ? [theme colorWithAlphaComponent:0.18]
+        : [UIColor colorWithWhite:1.0 alpha:0.055];
     self.scaleValueLabel.textColor = theme;
     self.graphicsScaleValueLabel.textColor = theme;
     self.anisotropyValueLabel.textColor = theme;
     self.menuScaleValueLabel.textColor = theme;
     self.opacityValueLabel.textColor = theme;
 
-    const BOOL glass = gLiquidGlassEnabled.load(std::memory_order_relaxed);
     self.glassView.hidden = !glass;
+    self.glassTintView.hidden = !glass;
     self.shineView.hidden = !glass;
     self.menuButtonGlass.hidden = !glass;
+    self.glassView.alpha = 0.58 + 0.34 * strength;
+    self.menuButtonGlass.alpha = 0.66 + 0.28 * strength;
+    self.shineView.alpha = 0.72 + 0.26 * strength;
+    UIColor *nativeTint = [theme colorWithAlphaComponent:0.09 + 0.11 * strength];
+    [self updateNativeGlassView:self.glassView tintColor:nativeTint];
+    [self updateNativeGlassView:self.menuButtonGlass
+                      tintColor:[theme colorWithAlphaComponent:0.14 + 0.10 * strength]];
+
     self.menuButton.backgroundColor = glass
-        ? [UIColor colorWithWhite:1.0 alpha:0.055]
-        : [UIColor colorWithWhite:0.055 alpha:0.98];
+        ? [theme colorWithAlphaComponent:0.045 + 0.07 * strength]
+        : [UIColor colorWithWhite:0.055 alpha:0.90 + 0.08 * strength];
     self.panel.backgroundColor = glass
-        ? [UIColor colorWithWhite:0.055 alpha:0.28]
-        : [UIColor colorWithWhite:0.045 alpha:0.985];
+        ? [UIColor colorWithWhite:0.025 alpha:0.11 + 0.10 * strength]
+        : [UIColor colorWithWhite:0.040 alpha:0.82 + 0.16 * strength];
+    self.glassTintView.backgroundColor =
+        [theme colorWithAlphaComponent:0.025 + 0.095 * strength];
     self.shineGradient.colors = @[
-        (id)[UIColor colorWithWhite:1.0 alpha:0.22].CGColor,
-        (id)[UIColor colorWithWhite:1.0 alpha:0.045].CGColor,
-        (id)[theme colorWithAlphaComponent:0.035].CGColor,
-        (id)[UIColor colorWithWhite:0.0 alpha:0.08].CGColor
+        (id)[UIColor colorWithWhite:1.0 alpha:0.27].CGColor,
+        (id)[UIColor colorWithWhite:1.0 alpha:0.060].CGColor,
+        (id)UIColor.clearColor.CGColor,
+        (id)[UIColor colorWithWhite:0.0 alpha:0.10].CGColor
     ];
-    self.shineGradient.locations = @[@0.0, @0.24, @0.62, @1.0];
+    self.shineGradient.locations = @[@0.0, @0.18, @0.56, @1.0];
+    self.glassRimGradient.colors = @[
+        (id)[UIColor colorWithWhite:1.0 alpha:0.74].CGColor,
+        (id)[UIColor colorWithWhite:1.0 alpha:0.10].CGColor,
+        (id)[theme colorWithAlphaComponent:0.22].CGColor,
+        (id)[UIColor colorWithWhite:1.0 alpha:0.42].CGColor
+    ];
+    self.glassRimGradient.locations = @[@0.0, @0.27, @0.70, @1.0];
 }
 
 - (void)settingsDidChange {
     const GBModuleMode mode = GBCurrentModuleMode();
     self.gameMasterSwitch.on = mode == GBModuleModeGameBoost;
     self.graphicsMasterSwitch.on = mode == GBModuleModeEnhanceGraphics;
-    const BOOL configuredIpadMode =
-        gConfiguredIpadModeEnabled.load(std::memory_order_relaxed);
-    const GBIpadProfile configuredIpadProfile = GBSanitizeIpadProfile(
-        gConfiguredIpadProfile.load(std::memory_order_relaxed));
-    self.ipadMasterSwitch.on = configuredIpadMode;
     self.gameScroll.userInteractionEnabled = mode == GBModuleModeGameBoost;
     self.graphicsScroll.userInteractionEnabled = mode == GBModuleModeEnhanceGraphics;
-    self.ipadScroll.userInteractionEnabled = configuredIpadMode;
     self.gameScroll.alpha = mode == GBModuleModeGameBoost ? 1.0 : 0.34;
     self.graphicsScroll.alpha = mode == GBModuleModeEnhanceGraphics ? 1.0 : 0.34;
-    self.ipadScroll.alpha = configuredIpadMode ? 1.0 : 0.42;
     self.gameStatusLabel.text = mode == GBModuleModeGameBoost
         ? @"● MODULE ĐANG BẬT"
         : @"MODULE ĐÃ KHÓA • BẬT Ở BÊN TRÁI";
     self.graphicsStatusLabel.text = mode == GBModuleModeEnhanceGraphics
         ? @"● MODULE ĐANG BẬT"
         : @"MODULE ĐÃ KHÓA • BẬT Ở BÊN TRÁI";
-    const BOOL ipadNeedsRelaunch =
-        configuredIpadMode != gLaunchedIpadModeEnabled ||
-        (configuredIpadMode && configuredIpadProfile != gLaunchedIpadProfile);
-    if (configuredIpadMode) {
-        self.ipadStatusLabel.text = ipadNeedsRelaunch
-            ? @"● ĐÃ LƯU • MỞ LẠI APP ↻"
-            : @"● IPAD MODE ĐANG BẬT";
-    } else {
-        self.ipadStatusLabel.text = ipadNeedsRelaunch
-            ? @"ĐÃ TẮT • MỞ LẠI APP ↻"
-            : @"MODULE ĐÃ KHÓA • BẬT Ở BÊN TRÁI";
-    }
-    self.ipadProfileControl.selectedSegmentIndex =
-        configuredIpadProfile == GBIpadProfilePUBGView ? 1 : 0;
-    self.ipadProfileHintLabel.text = configuredIpadProfile == GBIpadProfilePUBGView
-        ? @"PUBG iPad View • báo UIKit là iPad và ép Metal backing surface về 4:3. Không đổi bounds cảm ứng thật; có thể khác nhau tùy renderer."
-        : @"Roblox Tablet UI • báo UIDevice và trait collection là iPad. Không đổi framebuffer, không giả RAM/GPU và không can thiệp UI riêng của từng experience.";
-
     self.performanceSwitch.on = gPerformanceEnabled.load(std::memory_order_relaxed);
     self.lowLatencySwitch.on = gLowLatencyEnabled.load(std::memory_order_relaxed);
     self.keepAwakeSwitch.on = gKeepAwakeEnabled.load(std::memory_order_relaxed);
@@ -2009,8 +1880,7 @@ static UIColor *GBThemeColor(void) {
 
     self.gameScroll.hidden = self.selectedTab != 0;
     self.graphicsScroll.hidden = self.selectedTab != 1;
-    self.ipadScroll.hidden = self.selectedTab != 2;
-    self.settingsScroll.hidden = self.selectedTab != 3;
+    self.settingsScroll.hidden = self.selectedTab != 2;
     [self.panel bringSubviewToFront:self.closeButton];
     [self applyVisualSettings];
     [self.view setNeedsLayout];
@@ -2027,11 +1897,6 @@ static UIColor *GBThemeColor(void) {
 }
 
 - (void)selectSettingsTab {
-    self.selectedTab = 3;
-    [self settingsDidChange];
-}
-
-- (void)selectIpadTab {
     self.selectedTab = 2;
     [self settingsDidChange];
 }
@@ -2042,21 +1907,6 @@ static UIColor *GBThemeColor(void) {
 
 - (void)graphicsMasterChanged:(UISwitch *)sender {
     GBSetModuleMode(sender.isOn ? GBModuleModeEnhanceGraphics : GBModuleModeNone, YES);
-}
-
-- (void)ipadMasterChanged:(UISwitch *)sender {
-    GBSetIpadModeEnabled(sender.isOn, YES);
-}
-
-- (void)ipadProfileChanged:(UISegmentedControl *)sender {
-    GBSetIpadProfile(sender.selectedSegmentIndex == 1
-        ? GBIpadProfilePUBGView
-        : GBIpadProfileRobloxTablet, YES);
-}
-
-- (void)resetIpadMode {
-    GBSetIpadProfile(GBIpadProfileRobloxTablet, YES);
-    GBSetIpadModeEnabled(NO, YES);
 }
 
 - (void)performanceSwitchChanged:(UISwitch *)sender {
@@ -2155,15 +2005,41 @@ static UIColor *GBThemeColor(void) {
 }
 
 - (void)togglePanel {
-    self.panel.hidden = !self.panel.hidden;
     if (!self.panel.hidden) {
-        [self.view setNeedsLayout];
-        [self.view layoutIfNeeded];
+        [self hidePanel];
+        return;
     }
+
+    [self.panel.layer removeAllAnimations];
+    self.panel.hidden = NO;
+    self.panel.alpha = 0.0;
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+    [UIView animateWithDuration:0.22
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction |
+                                UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        self.panel.alpha = 1.0;
+    } completion:nil];
 }
 
 - (void)hidePanel {
-    self.panel.hidden = YES;
+    if (self.panel.hidden) {
+        return;
+    }
+    [UIView animateWithDuration:0.16
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction |
+                                UIViewAnimationOptionCurveEaseIn
+                     animations:^{
+        self.panel.alpha = 0.0;
+    } completion:^(__unused BOOL finished) {
+        self.panel.hidden = YES;
+        self.panel.alpha = 1.0;
+    }];
 }
 
 - (void)dragMenuButton:(UIPanGestureRecognizer *)gesture {
@@ -2305,44 +2181,6 @@ static UIColor *GBThemeColor(void) {
 %end
 
 
-%hook UIDevice
-
-- (UIUserInterfaceIdiom)userInterfaceIdiom {
-    if (GBIsIpadModeActive()) {
-        return UIUserInterfaceIdiomPad;
-    }
-    return %orig;
-}
-
-- (NSString *)model {
-    if (GBIsIpadModeActive()) {
-        return @"iPad";
-    }
-    return %orig;
-}
-
-- (NSString *)localizedModel {
-    if (GBIsIpadModeActive()) {
-        return @"iPad";
-    }
-    return %orig;
-}
-
-%end
-
-
-%hook UITraitCollection
-
-- (UIUserInterfaceIdiom)userInterfaceIdiom {
-    if (GBIsIpadModeActive()) {
-        return UIUserInterfaceIdiomPad;
-    }
-    return %orig;
-}
-
-%end
-
-
 %hook UIScreen
 
 - (CGFloat)scale {
@@ -2372,7 +2210,6 @@ static UIColor *GBThemeColor(void) {
         (CGFloat)gResolutionScale.load(std::memory_order_relaxed);
     bounds.size.width = MAX(1.0, round(bounds.size.width * factor));
     bounds.size.height = MAX(1.0, round(bounds.size.height * factor));
-    bounds.size = GBApplyIpadViewportAspect(bounds.size);
     return bounds;
 }
 
@@ -2390,7 +2227,7 @@ static UIColor *GBThemeColor(void) {
         (CGFloat)gResolutionScale.load(std::memory_order_relaxed);
     size.width = MAX(1.0, round(size.width * factor));
     size.height = MAX(1.0, round(size.height * factor));
-    return GBApplyIpadViewportAspect(size);
+    return size;
 }
 
 %end
@@ -2422,8 +2259,7 @@ static UIColor *GBThemeColor(void) {
         return;
     }
 
-    if (fabs(gResolutionScale.load(std::memory_order_relaxed) - 1.0) < 0.001 &&
-        !GBIsPUBGIpadViewActive()) {
+    if (fabs(gResolutionScale.load(std::memory_order_relaxed) - 1.0) < 0.001) {
         %orig(drawableSize);
         return;
     }
@@ -2466,8 +2302,7 @@ static UIColor *GBThemeColor(void) {
         return;
     }
 
-    if (fabs(gResolutionScale.load(std::memory_order_relaxed) - 1.0) < 0.001 &&
-        !GBIsPUBGIpadViewActive()) {
+    if (fabs(gResolutionScale.load(std::memory_order_relaxed) - 1.0) < 0.001) {
         %orig(drawableSize);
         return;
     }
@@ -2616,30 +2451,6 @@ static UIColor *GBThemeColor(void) {
 %end
 
 
-%hookf(int, sysctlbyname, const char *name, void *oldValue, size_t *oldLength, void *newValue, size_t newLength) {
-    if (GBIsIpadModeActive() && newValue == nullptr && name != nullptr &&
-        std::strcmp(name, "hw.machine") == 0) {
-        return GBWriteSpoofedCString(GBIpadMachineIdentifier(),
-                                     oldValue,
-                                     oldLength);
-    }
-    return %orig;
-}
-
-
-%hookf(int, uname, struct utsname *systemInfo) {
-    int result = %orig;
-    if (result == 0 && GBIsIpadModeActive() && systemInfo != nullptr) {
-        const char *identifier = GBIpadMachineIdentifier();
-        std::memset(systemInfo->machine, 0, sizeof(systemInfo->machine));
-        std::strncpy(systemInfo->machine,
-                     identifier,
-                     sizeof(systemInfo->machine) - 1);
-    }
-    return result;
-}
-
-
 %ctor {
     @autoreleasepool {
         if (!GBShouldLoadInCurrentProcess()) {
@@ -2675,11 +2486,6 @@ static UIColor *GBThemeColor(void) {
             : GBModuleModeNone;
         BOOL savedPerformance = [defaults boolForKey:GBPerformanceKey];
         BOOL savedLandscapeLock = [defaults boolForKey:GBLandscapeLockKey];
-        BOOL savedIpadMode = [defaults boolForKey:GBIpadModeEnabledKey];
-        GBIpadProfile savedIpadProfile = GBSanitizeIpadProfile(
-            [defaults objectForKey:GBIpadProfileKey] == nil
-                ? GBIpadProfileRobloxTablet
-                : [defaults integerForKey:GBIpadProfileKey]);
 
         const double gameScale = GBClampGameScale(savedScale);
         const double graphicsScale = GBClampGraphicsScale(savedGraphicsScale);
@@ -2695,10 +2501,6 @@ static UIColor *GBThemeColor(void) {
         gConfiguredGraphicsScale.store(graphicsScale, std::memory_order_relaxed);
         gPerformanceEnabled.store(savedPerformance, std::memory_order_relaxed);
         gLandscapeLockEnabled.store(savedLandscapeLock, std::memory_order_relaxed);
-        gConfiguredIpadModeEnabled.store(savedIpadMode, std::memory_order_relaxed);
-        gConfiguredIpadProfile.store((int)savedIpadProfile, std::memory_order_relaxed);
-        gLaunchedIpadModeEnabled = savedIpadMode;
-        gLaunchedIpadProfile = savedIpadProfile;
         gFrameRate.store(GBSanitizeFrameRate([defaults integerForKey:GBFrameRateKey]),
                          std::memory_order_relaxed);
         gLowLatencyEnabled.store([defaults boolForKey:GBLowLatencyKey],
