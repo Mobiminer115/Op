@@ -40,12 +40,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          for required_file in Makefile control Tweak.xm GameBoost.plist; do
+          for required_file in \
+            Makefile \
+            control \
+            Tweak.xm \
+            GameBoost.plist \
+            Sources/GameBoostShared.h \
+            Sources/GameBoostState.mm \
+            Sources/GameBoostDeviceProfiles.mm \
+            Sources/GameBoostRuntime.mm \
+            Sources/GameBoostRenderRuntime.mm \
+            Sources/GameBoostSettings.mm \
+            Sources/GameBoostGlass.h \
+            Sources/GameBoostGlass.mm \
+            Sources/GameBoostOverlay.mm \
+            Sources/GameBoostUIKitHooks.xm \
+            Sources/GameBoostRenderHooks.xm \
+            Sources/GameBoostIdentityHooks.xm; do
             if [[ ! -f "$required_file" ]]; then
               echo "Missing required file: $required_file" >&2
               exit 1
             fi
           done
+
+          source_paths=(Tweak.xm Sources/*.h Sources/*.mm Sources/*.xm)
+          tweak_line_count="$(wc -l < Tweak.xm)"
+          if (( tweak_line_count > 250 )); then
+            echo "Tweak.xm must stay a small bootstrap (got $tweak_line_count lines)" >&2
+            exit 1
+          fi
 
           plutil -lint GameBoost.plist
           filter_bundle="$(/usr/libexec/PlistBuddy -c 'Print :Filter:Bundles:0' GameBoost.plist)"
@@ -82,37 +105,58 @@ jobs:
             'self.graphicsScaleSlider.maximumValue = 1.5f' \
             'self.gameScroll.userInteractionEnabled' \
             'GBLiquidGlassKey' \
-            'glassEffectWithTint' \
-            'self.glassTintView' \
-            'self.glassRimGradient' \
+            'GBGlassSurfaceView' \
+            'newNativeGlassEffectWithTint' \
+            'applyFallbackBlurWithDensity' \
+            'effectView.effect = nativeEffect' \
             'self.panel.alpha = 1.0' \
             'GBIpadModeEnabledKey' \
             'GBRobloxVirtualLogicalSize' \
             'GBPUBGDrawableSize' \
+            'const CGFloat originalScale = %orig;' \
             'kCAGravityResizeAspect' \
             'self.ipadMasterSwitch' \
             'buildIpadPage' \
+            'GBInitializeRuntimeState' \
+            'GameBoostUIKitHooks' \
             'GBApplyMetalLayerOptions'; do
-            if ! grep -Fq "$source_marker" Tweak.xm; then
-              echo "Missing GameBoost v3.2 implementation marker: $source_marker" >&2
+            if ! grep -Fq "$source_marker" "${source_paths[@]}"; then
+              echo "Missing GameBoost v4.0 implementation marker: $source_marker" >&2
               exit 1
             fi
           done
 
-          if grep -Fq 'GBApplyIpadViewportAspect' Tweak.xm; then
+          if grep -Fq 'GBApplyIpadViewportAspect' "${source_paths[@]}"; then
             echo "Legacy stretched 4:3 implementation must not return" >&2
             exit 1
           fi
 
-          if grep -Eq 'CGAffineTransform|setTransform:|\.transform[[:space:]]*=' Tweak.xm; then
+          if grep -Eq 'CGAffineTransform|setTransform:|\.transform[[:space:]]*=' "${source_paths[@]}"; then
             echo "View transforms are forbidden: resolution scaling must not zoom the app" >&2
             exit 1
           fi
 
-          if grep -Fq 'NSProcessInfoThermalStateDidChangeNotification' Tweak.xm; then
+          if grep -Fq 'NSProcessInfoThermalStateDidChangeNotification' "${source_paths[@]}"; then
             echo "Performance QoS must not be auto-disabled by thermal notifications" >&2
             exit 1
           fi
+
+          for modular_source in \
+            Sources/GameBoostState.mm \
+            Sources/GameBoostDeviceProfiles.mm \
+            Sources/GameBoostRuntime.mm \
+            Sources/GameBoostRenderRuntime.mm \
+            Sources/GameBoostSettings.mm \
+            Sources/GameBoostGlass.mm \
+            Sources/GameBoostOverlay.mm \
+            Sources/GameBoostUIKitHooks.xm \
+            Sources/GameBoostRenderHooks.xm \
+            Sources/GameBoostIdentityHooks.xm; do
+            if ! grep -Fq "$modular_source" Makefile; then
+              echo "Makefile does not compile modular source: $modular_source" >&2
+              exit 1
+            fi
+          done
 
           if ! grep -Eq '^GameBoost_FRAMEWORKS.*MetalKit' Makefile; then
             echo "MetalKit must be linked for MTKView drawable-size synchronization" >&2
