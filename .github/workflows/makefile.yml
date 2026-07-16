@@ -58,6 +58,10 @@ jobs:
             '%hook UIApplication' \
             '%hook UIScreen' \
             '%hook UIScreenMode' \
+            '%hook UIDevice' \
+            '%hook UITraitCollection' \
+            '%hookf(int, sysctlbyname' \
+            '%hookf(int, uname' \
             '%hook MTKView' \
             '%hook CADisplayLink' \
             '%hook CAMetalLayer' \
@@ -77,9 +81,14 @@ jobs:
             'self.graphicsScaleSlider.maximumValue = 1.5f' \
             'self.gameScroll.userInteractionEnabled' \
             'GBLiquidGlassKey' \
+            'GBIpadModeEnabledKey' \
+            'GBIpadProfilePUBGView' \
+            'GBApplyIpadViewportAspect' \
+            'self.ipadMasterSwitch' \
+            'buildIpadPage' \
             'GBApplyMetalLayerOptions'; do
             if ! grep -Fq "$source_marker" Tweak.xm; then
-              echo "Missing GameBoost v2 implementation marker: $source_marker" >&2
+              echo "Missing GameBoost v3 implementation marker: $source_marker" >&2
               exit 1
             fi
           done
