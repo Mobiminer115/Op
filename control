@@ -1,8 +1,8 @@
 Package: com.gameboost.universal
 Name: GameBoost Universal
-Version: 3.1.0
+Version: 3.2.0
 Architecture: iphoneos-arm
-Description: GameBoost and Enhance Graphic in a three-tab Liquid Glass overlay for UIKit and Metal games.
+Description: GameBoost, Enhance Graphic and corrected Roblox/PUBG iPad spoof adapters in a Liquid Glass overlay.
 Maintainer: GameBoost
 Author: GameBoost
 Section: Tweaks

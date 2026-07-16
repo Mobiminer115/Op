@@ -1,14 +1,15 @@
-# GameBoost Universal 3.1
+# GameBoost Universal 3.2
 
 Theos tweak dành cho thiết bị iOS đã jailbreak. Một lần chạy GitHub Actions sẽ
 build và kiểm tra ba artifact: rootful legacy, rootful hiện đại và rootless.
 
 ## Menu và cơ chế module
 
-Menu có sidebar bên trái với ba mục:
+Menu có sidebar bên trái với bốn mục:
 
 - **GameBoost** có công tắc master riêng.
 - **Enhance Graphic** có công tắc master riêng.
+- **Device Spoof** có master và hai adapter Roblox/PUBG.
 - **Settings** luôn hoạt động.
 
 GameBoost và Enhance Graphic dùng chung một trạng thái module nên không thể bật
@@ -60,19 +61,31 @@ descriptor không hợp lệ chỉ để cố ép chất lượng.
   viền phản quang và shadow mềm. Màu chủ đề chỉ làm accent thay vì phủ neon lên
   toàn bộ panel.
 
-## Vì sao bỏ Device Spoof
+## Device Spoof 3.2
 
-Thử nghiệm thực tế cho thấy giả `UIDevice`/trait chỉ phóng to Roblox nhưng không
-mở thêm slot hay leaderboard, vì các phần đó do logic riêng của client và từng
-experience quyết định. Ép Metal framebuffer 4:3 trong PUBG lại kéo giãn surface
-trên màn hình điện thoại thay vì đổi camera/FOV. Bản 3.1 gỡ toàn bộ hook spoof và
-không còn sửa identity, trait hay tỉ lệ viewport của game.
+Spoof được lưu riêng theo từng app và chỉ áp dụng từ lần mở app kế tiếp. Cả hai
+adapter đều giả `UIDevice`, machine identifier và regular size class, nhưng xử
+lý viewport khác nhau:
+
+- `Roblox Tablet`: giữ nguyên tỉ lệ màn hình thật, đồng thời tăng không gian
+  logical cùng một hệ số để cạnh dài vượt 1024 và cạnh ngắn vượt 500. Đây là hai
+  ngưỡng mà CoreGui dùng để chọn hotbar đầy đủ và player list thay cho bố cục
+  điện thoại. `UIScreen.scale` được giảm tương ứng nên backing pixel không bị
+  kéo giãn.
+- `PUBG 4:3 Fit`: tạo drawable 4:3 cho renderer nhưng compose bằng
+  `kCAGravityResizeAspect`. Khung hình giữ đúng tỉ lệ và có thể xuất hiện viền
+  hai bên thay vì kéo surface 4:3 tràn toàn màn hình như bản 3.0. Tọa độ touch
+  được remap vào vùng nội dung 4:3.
+
+Adapter chỉ tác động API thiết bị/viewport; không sửa dữ liệu game, packet,
+inventory hay shader. Game cập nhật cách nhận diện thiết bị vẫn có thể cần điều
+chỉnh adapter ở phiên bản sau.
 
 ## Thay đổi cần mở lại app
 
 Game engine thường cache kích thước viewport và pipeline khi khởi động. Vì vậy
-chuyển module hoặc thay đổi downscale/Super Resolution được lưu ngay nhưng chỉ
-đổi framebuffer an toàn sau khi đóng hẳn rồi mở lại app.
+chuyển module, thay đổi downscale/Super Resolution hoặc đổi spoof preset được
+lưu ngay nhưng chỉ đổi framebuffer/traits an toàn sau khi đóng hẳn rồi mở lại app.
 Menu hiển thị ký hiệu `↻` khi đang chờ áp dụng. Filter sampler cũng chỉ tác động
 chắc chắn tới pipeline được tạo sau khi module Enhance Graphic bật.
 
@@ -109,7 +122,7 @@ artifact legacy chỉ build `arm64`.
 3. Mở **Actions → Build GameBoost Universal → Run workflow**.
 4. Chờ cả ba matrix job xanh rồi tải artifact phù hợp thiết bị.
 
-Workflow kiểm tra plist, source marker v3.1, kiến trúc dylib, framework liên kết và
+Workflow kiểm tra plist, source marker v3.2, kiến trúc dylib, framework liên kết và
 đầu ra `.deb`/`.dylib`/`.plist`. Thiếu một điều kiện thì job dừng thay vì upload
 artifact không đầy đủ.
 
