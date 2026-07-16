@@ -183,10 +183,26 @@ static UIColor *GBThemeColor(void) {
             @"Menu": @"slider.horizontal.3"
         };
         UIImage *image = [UIImage systemImageNamed:symbols[title]];
-        [button setImage:image forState:UIControlStateNormal];
         button.tintColor = UIColor.whiteColor;
-        button.imageEdgeInsets = UIEdgeInsetsMake(0.0, 8.0, 0.0, 0.0);
-        button.titleEdgeInsets = UIEdgeInsetsMake(0.0, 14.0, 0.0, 0.0);
+        if (@available(iOS 15.0, *)) {
+            UIButtonConfiguration *configuration =
+                [UIButtonConfiguration plainButtonConfiguration];
+            configuration.title = title;
+            configuration.image = image;
+            configuration.imagePadding = 10.0;
+            configuration.contentInsets = NSDirectionalEdgeInsetsMake(0.0,
+                                                                        10.0,
+                                                                        0.0,
+                                                                        8.0);
+            configuration.baseForegroundColor = UIColor.whiteColor;
+            button.configuration = configuration;
+        } else {
+            [button setImage:image forState:UIControlStateNormal];
+            if (image != nil) {
+                [button setTitle:[@"  " stringByAppendingString:title]
+                         forState:UIControlStateNormal];
+            }
+        }
     }
     [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
     return button;

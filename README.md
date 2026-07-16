@@ -1,4 +1,4 @@
-# GameBoost Universal 4.0
+# GameBoost Universal 4.0.1
 
 Theos tweak dành cho thiết bị iOS đã jailbreak. Một lần chạy GitHub Actions sẽ
 build và kiểm tra ba artifact: rootful legacy, rootful hiện đại và rootless.
@@ -142,7 +142,7 @@ artifact legacy chỉ build `arm64`.
 3. Mở **Actions → Build GameBoost Universal → Run workflow**.
 4. Chờ cả ba matrix job xanh rồi tải artifact phù hợp thiết bị.
 
-Workflow kiểm tra plist, source marker v4.0, kiến trúc dylib, framework liên kết và
+Workflow kiểm tra plist, source marker v4.0.1, kiến trúc dylib, framework liên kết và
 đầu ra `.deb`/`.dylib`/`.plist`. Thiếu một điều kiện thì job dừng thay vì upload
 artifact không đầy đủ.
 

@@ -1,6 +1,6 @@
 Package: com.gameboost.universal
 Name: GameBoost Universal
-Version: 4.0.0
+Version: 4.0.1
 Architecture: iphoneos-arm
 Description: Modular GameBoost runtime with Roblox/PUBG iPad profiles and an adaptive Liquid Glass control center.
 Maintainer: GameBoost
