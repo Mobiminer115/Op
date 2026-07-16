@@ -106,6 +106,7 @@ jobs:
             'self.gameScroll.userInteractionEnabled' \
             'GBLiquidGlassKey' \
             'GBGlassSurfaceView' \
+            'UIButtonConfiguration' \
             'newNativeGlassEffectWithTint' \
             'applyFallbackBlurWithDensity' \
             'effectView.effect = nativeEffect' \
@@ -121,7 +122,7 @@ jobs:
             'GameBoostUIKitHooks' \
             'GBApplyMetalLayerOptions'; do
             if ! grep -Fq "$source_marker" "${source_paths[@]}"; then
-              echo "Missing GameBoost v4.0 implementation marker: $source_marker" >&2
+              echo "Missing GameBoost v4.0.1 implementation marker: $source_marker" >&2
               exit 1
             fi
           done
@@ -138,6 +139,11 @@ jobs:
 
           if grep -Fq 'NSProcessInfoThermalStateDidChangeNotification' "${source_paths[@]}"; then
             echo "Performance QoS must not be auto-disabled by thermal notifications" >&2
+            exit 1
+          fi
+
+          if grep -Eq '\.(imageEdgeInsets|titleEdgeInsets|contentEdgeInsets)[[:space:]]*=' "${source_paths[@]}"; then
+            echo "Deprecated UIButton edge-inset properties are forbidden under -Werror" >&2
             exit 1
           fi
 
