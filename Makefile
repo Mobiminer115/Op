@@ -10,7 +10,18 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = GameBoost
 
-GameBoost_FILES = Tweak.xm
+GameBoost_FILES = \
+	Tweak.xm \
+	Sources/GameBoostState.mm \
+	Sources/GameBoostDeviceProfiles.mm \
+	Sources/GameBoostRuntime.mm \
+	Sources/GameBoostRenderRuntime.mm \
+	Sources/GameBoostSettings.mm \
+	Sources/GameBoostGlass.mm \
+	Sources/GameBoostOverlay.mm \
+	Sources/GameBoostUIKitHooks.xm \
+	Sources/GameBoostRenderHooks.xm \
+	Sources/GameBoostIdentityHooks.xm
 GameBoost_CFLAGS = -fobjc-arc
 GameBoost_CCFLAGS = -std=c++17
 GameBoost_FRAMEWORKS = Foundation UIKit QuartzCore Metal MetalKit

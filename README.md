@@ -1,20 +1,38 @@
-# GameBoost Universal 3.2
+# GameBoost Universal 4.0
 
 Theos tweak dành cho thiết bị iOS đã jailbreak. Một lần chạy GitHub Actions sẽ
 build và kiểm tra ba artifact: rootful legacy, rootful hiện đại và rootless.
 
+## Cấu trúc source 4.0
+
+`Tweak.xm` chỉ còn bootstrap và nạp cấu hình ban đầu. Phần còn lại được tách theo
+trách nhiệm để sửa một tính năng không phải chạm vào toàn bộ tweak:
+
+- `GameBoostState.mm` và `GameBoostShared.h`: state, key và API dùng chung.
+- `GameBoostDeviceProfiles.mm`: metrics Roblox Tablet/PUBG 4:3.
+- `GameBoostRuntime.mm`: lifecycle, performance và orientation.
+- `GameBoostRenderRuntime.mm`: resolution, FPS và Metal runtime.
+- `GameBoostSettings.mm`: cập nhật/persist cấu hình.
+- `GameBoostGlass.mm`: native `UIGlassEffect` và blur fallback.
+- `GameBoostOverlay.mm`: controller và layout của Control Center.
+- ba file `*Hooks.xm`: UIKit/device, renderer và machine identity.
+
+Workflow giới hạn `Tweak.xm` ở tối đa 250 dòng và kiểm tra mọi source module có
+được Makefile compile hay không.
+
 ## Menu và cơ chế module
 
-Menu có sidebar bên trái với bốn mục:
+Control Center có sidebar bên trái với bốn mục:
 
-- **GameBoost** có công tắc master riêng.
-- **Enhance Graphic** có công tắc master riêng.
-- **Device Spoof** có master và hai adapter Roblox/PUBG.
-- **Settings** luôn hoạt động.
+- **Game** có công tắc master ở đầu trang.
+- **Display** có công tắc master ở đầu trang.
+- **iPad View** có master và hai profile Roblox/PUBG.
+- **Menu** luôn hoạt động.
 
 GameBoost và Enhance Graphic dùng chung một trạng thái module nên không thể bật
 cùng lúc. Bật module này sẽ tắt module kia. Khi master của một module đang tắt,
-toàn bộ vùng điều khiển của module đó vẫn hiển thị nhưng không nhận tương tác.
+các tùy chọn con bị khóa nhưng trang vẫn cuộn được và công tắc master vẫn luôn
+nhận tương tác.
 Cấu hình con không bị xóa, vì vậy lần bật sau vẫn giữ lựa chọn cũ.
 App chưa từng có cấu hình sẽ khởi động với cả hai module tắt; cấu hình từ bản
 1.x được tự chuyển sang GameBoost để không làm mất thiết lập cũ.
@@ -56,12 +74,14 @@ descriptor không hợp lệ chỉ để cố ép chất lượng.
 - Đổi màu chủ đề bằng hue slider.
 - Đổi độ đậm của vật liệu kính 45–100%; không còn chỉnh `alpha` của cả panel nên
   màu tint, blur và chữ/điều khiển cập nhật độc lập.
-- `Liquid Glass 26` dùng `UIGlassEffect` bằng runtime lookup trên hệ điều hành có
-  API này. iOS 12–18 dùng material blur dự phòng với tint động, highlight chéo,
-  viền phản quang và shadow mềm. Màu chủ đề chỉ làm accent thay vì phủ neon lên
-  toàn bộ panel.
+- `Liquid Glass` dùng `UIGlassEffect` bằng runtime lookup trên hệ điều hành có
+  API này. Mỗi lần đổi tint, component tạo effect mới và gán qua `effect` để hệ
+  thống cập nhật material đúng cách. iOS 12–18 dùng material blur có cường độ
+  điều khiển bằng `UIViewPropertyAnimator`; tint, blur và độ đậm vì vậy vẫn đổi
+  được khi Liquid Glass đang bật. Highlight/rim được giữ nhẹ và màu chủ đề chỉ
+  làm accent thay vì phủ neon lên toàn bộ panel.
 
-## Device Spoof 3.2
+## iPad View 4.0
 
 Spoof được lưu riêng theo từng app và chỉ áp dụng từ lần mở app kế tiếp. Cả hai
 adapter đều giả `UIDevice`, machine identifier và regular size class, nhưng xử
@@ -122,7 +142,7 @@ artifact legacy chỉ build `arm64`.
 3. Mở **Actions → Build GameBoost Universal → Run workflow**.
 4. Chờ cả ba matrix job xanh rồi tải artifact phù hợp thiết bị.
 
-Workflow kiểm tra plist, source marker v3.2, kiến trúc dylib, framework liên kết và
+Workflow kiểm tra plist, source marker v4.0, kiến trúc dylib, framework liên kết và
 đầu ra `.deb`/`.dylib`/`.plist`. Thiếu một điều kiện thì job dừng thay vì upload
 artifact không đầy đủ.
 
