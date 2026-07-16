@@ -58,6 +58,11 @@ jobs:
             '%hook UIApplication' \
             '%hook UIScreen' \
             '%hook UIScreenMode' \
+            '%hook UIDevice' \
+            '%hook UITraitCollection' \
+            '%hook UITouch' \
+            '%hookf(int, sysctlbyname' \
+            '%hookf(int, uname' \
             '%hook MTKView' \
             '%hook CADisplayLink' \
             '%hook CAMetalLayer' \
@@ -81,25 +86,23 @@ jobs:
             'self.glassTintView' \
             'self.glassRimGradient' \
             'self.panel.alpha = 1.0' \
+            'GBIpadModeEnabledKey' \
+            'GBRobloxVirtualLogicalSize' \
+            'GBPUBGDrawableSize' \
+            'kCAGravityResizeAspect' \
+            'self.ipadMasterSwitch' \
+            'buildIpadPage' \
             'GBApplyMetalLayerOptions'; do
             if ! grep -Fq "$source_marker" Tweak.xm; then
-              echo "Missing GameBoost v3.1 implementation marker: $source_marker" >&2
+              echo "Missing GameBoost v3.2 implementation marker: $source_marker" >&2
               exit 1
             fi
           done
 
-          for removed_spoof_marker in \
-            'GBIpadModeEnabledKey' \
-            'GBApplyIpadViewportAspect' \
-            '%hook UIDevice' \
-            '%hook UITraitCollection' \
-            '%hookf(int, sysctlbyname' \
-            '%hookf(int, uname'; do
-            if grep -Fq "$removed_spoof_marker" Tweak.xm; then
-              echo "Removed device spoof code is still present: $removed_spoof_marker" >&2
-              exit 1
-            fi
-          done
+          if grep -Fq 'GBApplyIpadViewportAspect' Tweak.xm; then
+            echo "Legacy stretched 4:3 implementation must not return" >&2
+            exit 1
+          fi
 
           if grep -Eq 'CGAffineTransform|setTransform:|\.transform[[:space:]]*=' Tweak.xm; then
             echo "View transforms are forbidden: resolution scaling must not zoom the app" >&2
